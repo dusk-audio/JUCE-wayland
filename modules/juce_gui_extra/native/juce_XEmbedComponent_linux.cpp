@@ -267,8 +267,81 @@ public:
 
 private:
     //==============================================================================
+    class ComponentIsShowingListener : private ComponentMovementWatcher
+    {
+    public:
+        ComponentIsShowingListener (Component& componentIn, std::function<void()> callbackIn)
+            : ComponentMovementWatcher (&componentIn),
+              callback (std::move (callbackIn))
+        {}
+
+    private:
+        void componentMovedOrResized (bool, bool) override {}
+        void componentPeerChanged() override {}
+        void componentVisibilityChanged() override { NullCheckedInvocation::invoke (callback); }
+
+        using ComponentMovementWatcher::componentMovedOrResized;
+        using ComponentMovementWatcher::componentVisibilityChanged;
+
+        std::function<void()> callback;
+    };
+
+    class WindowMapper
+    {
+    public:
+        enum class Role { host, client };
+
+        WindowMapper (Pimpl& pimplIn, Window& windowIn, Role roleIn)
+            : pimpl (pimplIn),
+              window (windowIn),
+              role (roleIn)
+        {}
+
+        void update()
+        {
+            if (window == 0)
+                return;
+
+            const auto isShowing = pimpl.owner.isShowing() && pimpl.lastPeer != nullptr;
+
+            // Host visibility is JUCE's call: the host is the container we provide to
+            // the embedded child, and it must follow the JUCE component's visibility.
+            // _XEMBED_INFO XEMBED_MAPPED is the embedded *child's* preference for its
+            // own mapping; tying the host to it leaves non-spec-compliant clients
+            // (e.g. plugins that map themselves and set XEMBED_MAPPED=0) Unviewable
+            // because the parent never gets mapped.
+            const auto shouldBeMapped = role == Role::host
+                                      ? isShowing
+                                      : (isShowing && pimpl.getXEmbedMappedFlag());
+
+            if (std::exchange (mapped, shouldBeMapped) != shouldBeMapped)
+            {
+                if (shouldBeMapped)
+                    X11Symbols::getInstance()->xMapWindow (pimpl.getDisplay(), window);
+                else
+                    X11Symbols::getInstance()->xUnmapWindow (pimpl.getDisplay(), window);
+            }
+        }
+
+        void unmap()
+        {
+            if (window == 0)
+                return;
+
+            X11Symbols::getInstance()->xUnmapWindow (pimpl.getDisplay(), window);
+            mapped = false;
+        }
+
+    private:
+        Pimpl& pimpl;
+        Window& window;
+        Role role;
+        bool mapped = false;
+    };
+
     XEmbedComponent& owner;
     Window client = 0, host = 0;
+    WindowMapper clientMapper { *this, client, WindowMapper::Role::client }, hostMapper { *this, host, WindowMapper::Role::host };
     Atom infoAtom, messageTypeAtom;
 
     bool clientInitiated;
