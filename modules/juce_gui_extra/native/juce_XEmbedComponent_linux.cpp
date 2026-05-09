@@ -310,9 +310,12 @@ private:
     class WindowMapper
     {
     public:
-        WindowMapper (Pimpl& pimplIn, Window& windowIn)
+        enum class Role { host, client };
+
+        WindowMapper (Pimpl& pimplIn, Window& windowIn, Role roleIn)
             : pimpl (pimplIn),
-              window (windowIn)
+              window (windowIn),
+              role (roleIn)
         {}
 
         void update()
@@ -320,9 +323,17 @@ private:
             if (window == 0)
                 return;
 
-            const auto shouldBeMapped =    pimpl.getXEmbedMappedFlag()
-                                        && pimpl.owner.isShowing()
-                                        && pimpl.lastPeer != nullptr;
+            const auto isShowing = pimpl.owner.isShowing() && pimpl.lastPeer != nullptr;
+
+            // Host visibility is JUCE's call: the host is the container we provide to
+            // the embedded child, and it must follow the JUCE component's visibility.
+            // _XEMBED_INFO XEMBED_MAPPED is the embedded *child's* preference for its
+            // own mapping; tying the host to it leaves non-spec-compliant clients
+            // (e.g. plugins that map themselves and set XEMBED_MAPPED=0) Unviewable
+            // because the parent never gets mapped.
+            const auto shouldBeMapped = role == Role::host
+                                      ? isShowing
+                                      : (isShowing && pimpl.getXEmbedMappedFlag());
 
             if (std::exchange (mapped, shouldBeMapped) != shouldBeMapped)
             {
@@ -345,13 +356,14 @@ private:
     private:
         Pimpl& pimpl;
         Window& window;
+        Role role;
         bool mapped = false;
     };
 
     XEmbedComponent& owner;
     ComponentIsShowingListener isShowingListener { owner, [this] { updateMapping(); } };
     Window client = 0, host = 0;
-    WindowMapper clientMapper { *this, client }, hostMapper { *this, host };
+    WindowMapper clientMapper { *this, client, WindowMapper::Role::client }, hostMapper { *this, host, WindowMapper::Role::host };
     Atom infoAtom, messageTypeAtom;
 
     bool clientInitiated;
