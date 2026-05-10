@@ -186,9 +186,13 @@ class WaylandComponentPeer final : public ComponentPeer, public Timer
                 continue;
             
             auto* otherPeer = c->getPeer();
-            jassert (otherPeer == nullptr || dynamic_cast<WaylandComponentPeer*> (c->getPeer()) != nullptr);
-            
-            if (auto* peer = static_cast<WaylandComponentPeer*> (otherPeer))
+            // Hosts can intentionally mix wl_surface and X11 peers
+            // (e.g. plugin-editor wrappers that opt into X11 via
+            // setSkipForPeerCreation). Skip non-Wayland peers - they
+            // can't be reasoned about in our local-coords arithmetic
+            // and dynamic_cast to nullptr is the correct skip signal.
+            auto* peer = dynamic_cast<WaylandComponentPeer*> (otherPeer);
+            if (peer != nullptr)
                 if (peer->contains (globalToLocal (*peer, localToGlobal (*this, localPos.toFloat())).roundToInt(), true))
                     return false;
         }

@@ -31,6 +31,30 @@ class WaylandWindowSystem : public DeletedAtShutdown
 public:
     bool isWaylandAvailable();
     bool isTouchAvailable();
+
+    // When latched true, Component::createNewPeer skips the Wayland
+    // backend and falls through to LinuxComponentPeer (X11) even on
+    // a Wayland session. The flag is latched (NOT one-shot): it stays
+    // set until the caller clears it explicitly. Thread-local storage
+    // so concurrent UI threads don't fight over the flag (peer
+    // creation is message-thread-only in practice, so this is mostly
+    // defensive).
+    //
+    // Why latched and not consume-on-read: TopLevelWindow ctor +
+    // setUsingNativeTitleBar + setResizable + lookAndFeelChanged each
+    // independently call recreateDesktopWindow → addToDesktop →
+    // createNewPeer. A one-shot flag only helps the first one; the
+    // recreations afterwards revert to wl_surface, which leaves the
+    // most-recent (Wayland) peer visible and the X11 peer destroyed.
+    //
+    // Use case: hosts that need an X11 toplevel for plugin XEmbed -
+    // VST3 IPlugView::attached takes "X11EmbedWindowID", LV2 uses
+    // LV2_UI__X11UI, and JUCE-based plugins assume X11 in their
+    // editor's renderer when loaded as a shared library on Linux.
+    // Caller pattern: set true before the wrapper's ctor base init,
+    // clear false at the end of the ctor body.
+    static void setSkipForPeerCreation (bool);
+    static bool shouldSkipForPeerCreation();
     
     ModifierKeys getNativeRealtimeModifiers();
     Point<float> getCurrentMousePosition();

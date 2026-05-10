@@ -267,9 +267,12 @@ public:
                 continue;
 
             auto* otherPeer = c->getPeer();
-            jassert (otherPeer == nullptr || dynamic_cast<LinuxComponentPeer*> (c->getPeer()) != nullptr);
-
-            if (auto* peer = static_cast<LinuxComponentPeer*> (otherPeer))
+            // Mixed-backend hosts (X11 plugin wrapper + wl_surface main
+            // window) put both peer types on the desktop list. Skip
+            // peers we can't downcast - they can't be reasoned about
+            // in our local-coords arithmetic.
+            auto* peer = dynamic_cast<LinuxComponentPeer*> (otherPeer);
+            if (peer != nullptr)
                 if (peer->contains (globalToLocal (*peer, localToGlobal (*this, localPos.toFloat())).roundToInt(), true))
                     return false;
         }
@@ -676,11 +679,12 @@ bool LinuxComponentPeer::isActiveApplication = false;
 ComponentPeer* Component::createNewPeer (int styleFlags, void* nativeWindowToAttachTo)
 {
 #if JUCE_WAYLAND
-    if (WaylandWindowSystem::getInstance()->isWaylandAvailable())  {
+    const bool skipWayland = WaylandWindowSystem::shouldSkipForPeerCreation();
+    if (! skipWayland && WaylandWindowSystem::getInstance()->isWaylandAvailable())  {
         return new WaylandComponentPeer (*this, styleFlags, (WaylandWindow*) nativeWindowToAttachTo);
     }
 #endif
-    
+
     return new LinuxComponentPeer (*this, styleFlags, (::Window) nativeWindowToAttachTo);
 }
 

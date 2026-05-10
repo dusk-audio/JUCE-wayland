@@ -931,6 +931,21 @@ bool WaylandWindowSystem::isWaylandAvailable()
     return initialised;
 }
 
+namespace
+{
+thread_local bool gSkipWaylandForPeerCreation = false;
+}
+
+void WaylandWindowSystem::setSkipForPeerCreation (bool b)
+{
+    gSkipWaylandForPeerCreation = b;
+}
+
+bool WaylandWindowSystem::shouldSkipForPeerCreation()
+{
+    return gSkipWaylandForPeerCreation;
+}
+
 bool WaylandWindowSystem::isTouchAvailable()
 {
   return hasTouch;
