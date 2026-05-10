@@ -729,6 +729,19 @@ struct SIMDNativeOps<uint64_t>
     }
 };
 
+
+// On Linux x86_64 long==int64_t but long long is a distinct (also-8-byte)
+// type that has no SIMD specialisation upstream. juce::int64 is `long long`
+// on every JUCE platform, so any code that does jmax<juce::int64>() etc.
+// triggers SIMDRegister<long long> instantiation during overload resolution.
+// Alias the long long specialisation to int64_t so the SIMD overload's
+// substitution doesn't hard-error (it falls through to the scalar
+// jmax<T>(T, T) overload as upstream does).
+#if defined (__GNUC__) && defined (__SIZEOF_LONG__) && __SIZEOF_LONG__ == 8 && !defined (_WIN32)
+template <> struct SIMDNativeOps<long long> : SIMDNativeOps<int64_t> {};
+template <> struct SIMDNativeOps<unsigned long long> : SIMDNativeOps<uint64_t> {};
+#endif
+
 JUCE_END_IGNORE_WARNINGS_GCC_LIKE
 
 } // namespace juce::dsp
