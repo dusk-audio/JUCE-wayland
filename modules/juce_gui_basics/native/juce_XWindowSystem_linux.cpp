@@ -1480,12 +1480,15 @@ static std::unordered_map<LinuxComponentPeer*, X11DragState> dragAndDropStateMap
 
 XWindowSystem::XWindowSystem()
 {
-    // If we load wayland without loadAllSymbols, it crashes for some reason
-    xIsAvailable = X11Symbols::getInstance()->loadAllSymbols()
-#if JUCE_WAYLAND
-    && ! WaylandWindowSystem::getInstance()->isWaylandAvailable()
-#endif
-    ;
+    // Open the X11 connection unconditionally. VST3 IPlugView::attached
+    // takes "X11EmbedWindowID" and LV2 uses LV2_UI__X11UI, so every
+    // Linux plugin editor is an X11 child window and XEmbedComponent
+    // needs a Display* regardless of whether the main app window is
+    // wl_surface. Top-level windowing routes to Wayland at the
+    // dispatch sites in juce_Windowing_x11.cpp via separate
+    // isWaylandAvailable() checks, so this only re-enables the X11
+    // connection for plugin hosting and X-side IPC.
+    xIsAvailable = X11Symbols::getInstance()->loadAllSymbols();
 
     if (! xIsAvailable)
         return;
