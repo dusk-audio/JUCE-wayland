@@ -43,6 +43,7 @@
   minimumCppStandard: 17
 
   dependencies:       juce_graphics juce_data_structures
+  linuxPackages:      wayland-client xkbcommon libdecor-0
   OSXFrameworks:      Cocoa QuartzCore
   WeakOSXFrameworks:  Metal MetalKit
   iOSFrameworks:      CoreServices UIKit
