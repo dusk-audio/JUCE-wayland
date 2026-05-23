@@ -692,7 +692,14 @@ ComponentPeer* Component::createNewPeer (int styleFlags, void* nativeWindowToAtt
 JUCE_API bool JUCE_CALLTYPE Process::isForegroundProcess()    {
 #if JUCE_WAYLAND
         if (WaylandWindowSystem::getInstance()->isWaylandAvailable())  {
-            return WaylandComponentPeer::isActiveApplication; 
+            // Mixed-backend: take OR of Wayland and X11 active flags so
+            // hosts that route every peer to X11 via setSkipForPeerCreation
+            // (no wl_surface peer ever exists) still report as foreground.
+            // PopupMenu / TooltipWindow / FileBrowser dismissal logic
+            // depends on this returning true while the app actually has
+            // input focus on any backend.
+            return WaylandComponentPeer::isActiveApplication
+                || LinuxComponentPeer::isActiveApplication;
         }
 #endif
     return LinuxComponentPeer::isActiveApplication;
