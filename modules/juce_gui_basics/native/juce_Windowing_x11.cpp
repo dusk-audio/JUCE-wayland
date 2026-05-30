@@ -923,37 +923,30 @@ private:
     static CursorHandle makeHandle (const detail::CustomMouseCursorInfo& info)
     {
         const auto image = info.image.getImage();
+        const auto scaled = image.rescaled ((int) (image.getWidth()  / info.image.getScale()),
+                                              (int) (image.getHeight() / info.image.getScale()));
         CursorHandle handle;
+        // Always build the X11 handle — hybrid X11-on-Wayland apps need
+        // it for peers routed through LinuxComponentPeer. The Wayland
+        // handle is built additionally so a pure-Wayland peer path
+        // (null peer in showInWindow's else branch) still has a cursor.
+        handle.x11 = XWindowSystem::getInstance()->createCustomMouseCursorInfo (scaled, info.hotspot);
 #if JUCE_WAYLAND
         if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
-        {
-            handle.wayland = WaylandWindowSystem::getInstance()->createCustomMouseCursorInfo (image.rescaled ((int) (image.getWidth()  / info.image.getScale()),
-                                                                                          (int) (image.getHeight() / info.image.getScale())), info.hotspot);
-        }
-        else
+            handle.wayland = WaylandWindowSystem::getInstance()->createCustomMouseCursorInfo (scaled, info.hotspot);
 #endif
-        {
-            handle.x11 = XWindowSystem::getInstance()->createCustomMouseCursorInfo (image.rescaled ((int) (image.getWidth()  / info.image.getScale()),
-                                                                                          (int) (image.getHeight() / info.image.getScale())), info.hotspot);
-        }
-        
         return handle;
     }
 
     static CursorHandle makeHandle (MouseCursor::StandardCursorType type)
-    {   
+    {
         CursorHandle handle;
+        // Same dual-handle policy as the image-cursor overload above.
+        handle.x11 = XWindowSystem::getInstance()->createStandardMouseCursor (type);
 #if JUCE_WAYLAND
         if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
-        {
             handle.wayland = WaylandWindowSystem::getInstance()->createStandardMouseCursor (type);
-        }
-        else
 #endif
-        {
-            handle.x11 = XWindowSystem::getInstance()->createStandardMouseCursor (type);
-        }
-        
         return handle;
     }
     
