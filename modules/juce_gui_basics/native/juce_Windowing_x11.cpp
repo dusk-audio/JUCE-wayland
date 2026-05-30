@@ -895,17 +895,28 @@ public:
 
     static void showInWindow (PlatformSpecificHandle* handle, ComponentPeer* peer)
     {
+        // Prefer the X11 path whenever a peer exists. Hybrid X11-on-
+        // Wayland apps (XWayland host for cross-toolkit plugin embedding)
+        // initialise the Wayland subsystem but route their actual peers
+        // through LinuxComponentPeer (X11). Dispatching to the Wayland
+        // path here would set the cursor on the Wayland global pointer
+        // — which is bound to a wl_surface our app never uses — so the
+        // real X11 window never gets the cursor update. Checking peer
+        // != nullptr is enough: a peer means there's a window to set
+        // the cursor on, and in our hybrid setup that window is X11.
+        if (peer != nullptr)
+        {
+            const auto cursor = handle != nullptr ? handle->cursorHandle.x11 : Cursor{};
+            XWindowSystem::getInstance()->showCursor ((::Window) peer->getNativeHandle(), cursor);
+            return;
+        }
 #if JUCE_WAYLAND
         if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
         {
             const auto cursor = handle != nullptr ? handle->cursorHandle.wayland : WaylandCursor{0, nullptr};
             WaylandWindowSystem::getInstance()->showCursor (cursor);
-            return;
         }
 #endif
-        const auto cursor = handle != nullptr ? handle->cursorHandle.x11 : Cursor{};
-        if (peer != nullptr)
-            XWindowSystem::getInstance()->showCursor ((::Window) peer->getNativeHandle(), cursor);
     }
 
 private:
