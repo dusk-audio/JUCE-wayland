@@ -614,6 +614,15 @@ struct AlsaMidiHelpers
             : listener (l), handle (h)
         {
             jassert (handle != nullptr);
+            // Seed the endpoint cache with ports that already exist at
+            // startup. Without this, cachedEndpoints stays empty until
+            // an ALSA SND_SEQ_EVENT_PORT_START arrives from the system
+            // ANNOUNCE port, which only fires for ports created AFTER
+            // this client connected. Pre-existing devices (e.g. a USB
+            // MIDI controller plugged in before the app launched) would
+            // otherwise be invisible to MidiInput::getAvailableDevices
+            // until hot-replugged.
+            cachedEndpoints = findEndpoints (handle.get());
         }
 
         void pushUmp (int port, ump::View view, double time) override
