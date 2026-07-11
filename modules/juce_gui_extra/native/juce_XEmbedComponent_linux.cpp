@@ -74,6 +74,13 @@ enum
 };
 
 //==============================================================================
+// Process-global "defer mapping" latch — see XEmbedComponent::setDeferMapping.
+// While true, any XEmbedComponent constructed is born with createdDuringDefer set
+// and its WindowMapper refuses to MAP (host + client embed + reparent still
+// happen) until the latch is lifted and the component is next shown.
+static bool& xembedDeferMappingFlag() noexcept   { static bool f = false; return f; }
+
+//==============================================================================
 class XEmbedComponent::Pimpl  : private ComponentListener
 {
 public:
@@ -331,9 +338,17 @@ private:
             // own mapping; tying the host to it leaves non-spec-compliant clients
             // (e.g. plugins that map themselves and set XEMBED_MAPPED=0) Unviewable
             // because the parent never gets mapped.
-            const auto shouldBeMapped = role == Role::host
-                                      ? isShowing
-                                      : (isShowing && pimpl.getXEmbedMappedFlag());
+            auto shouldBeMapped = role == Role::host
+                                ? isShowing
+                                : (isShowing && pimpl.getXEmbedMappedFlag());
+
+            // Deferred-map latch: an editor constructed while setDeferMapping(true)
+            // was active embeds + reparents normally but must NOT map until the
+            // latch is lifted and the component is revealed — lets a host build it
+            // fully off-screen (incl. the blocking attach) without a stray-window
+            // flash, then map it instantly on first genuine show.
+            if (pimpl.createdDuringDefer && xembedDeferMappingFlag())
+                shouldBeMapped = false;
 
             if (std::exchange (mapped, shouldBeMapped) != shouldBeMapped)
             {
@@ -367,6 +382,8 @@ private:
     Atom infoAtom, messageTypeAtom;
 
     bool clientInitiated;
+    // Captured at construction from the process-global defer-mapping latch.
+    const bool createdDuringDefer = xembedDeferMappingFlag();
     bool wantsFocus        = false;
     bool allowResize       = false;
     bool supportsXembed    = false;
@@ -759,6 +776,10 @@ private:
 XEmbedComponent::XEmbedComponent (bool wantsKeyboardFocus, bool allowForeignWidgetToResizeComponent)
     : pimpl (new Pimpl (*this, 0, wantsKeyboardFocus, false, allowForeignWidgetToResizeComponent))
 {
+    // Focal-wayland fork patch: opt-in opaque so JUCE backs the X11
+    // window with this Component's paint output (instead of leaving
+    // the native window's background unset — which on Wayland-via-
+    // XWayland sessions exposes desktop pixels behind the app).
     setOpaque (true);
 }
 
@@ -772,7 +793,13 @@ XEmbedComponent::~XEmbedComponent() {}
 
 void XEmbedComponent::paint (Graphics& g)
 {
-    g.fillAll (Colours::lightgrey);
+    // Focal-wayland fork patch: theme-driven fill (was hard-coded
+    // lightgrey). Lookup the host's window-background so plugins on
+    // dark themes don't show a bright halo where the embedded child
+    // doesn't paint. Empty paint() / transparent leaked desktop
+    // pixels through on Wayland-via-XWayland sessions because the
+    // native X11 window's background_pixel is unset.
+    g.fillAll (findColour (ResizableWindow::backgroundColourId));
 }
 
 void XEmbedComponent::focusGainedWithDirection (FocusChangeType changeType, FocusChangeDirection direction)
@@ -785,6 +812,7 @@ void XEmbedComponent::broughtToFront()                             { pimpl->brou
 unsigned long XEmbedComponent::getHostWindowID()                   { return pimpl->getHostWindowID(); }
 void XEmbedComponent::removeClient()                               { pimpl->setClient (0, true); }
 void XEmbedComponent::updateEmbeddedBounds()                       { pimpl->updateEmbeddedBounds(); }
+void XEmbedComponent::setDeferMapping (bool shouldDefer)           { xembedDeferMappingFlag() = shouldDefer; }
 
 //==============================================================================
 bool juce_handleXEmbedEvent (ComponentPeer* p, void* e)

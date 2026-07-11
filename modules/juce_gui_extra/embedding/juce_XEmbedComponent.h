@@ -108,6 +108,20 @@ public:
     /** Forces the embedded window to match the current size of this component. */
     void updateEmbeddedBounds();
 
+    /** Process-global latch (Linux/X11). While set, any XEmbedComponent that is
+        constructed embeds its foreign window normally but DEFERS mapping it — the
+        host + client X11 windows are created and reparented onto the peer, yet
+        stay unmapped even when the component is showing, until the latch is lifted
+        and the component is next shown.
+
+        This lets a host build a plugin editor fully off-screen — including the
+        blocking VST3 view->attached() embed, which only runs while the editor is
+        visible — without the stray-window flash, then reveal it instantly. Usage:
+        setDeferMapping(true); build the editor visible-but-off-screen; hide it;
+        setDeferMapping(false). The editor then maps on its next genuine show.
+        No-op on non-X11 platforms. */
+    static void setDeferMapping (bool shouldDefer);
+
 protected:
     //==============================================================================
     /** @internal */
