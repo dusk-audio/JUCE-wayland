@@ -101,12 +101,12 @@ XWindowSystemUtilities::ScopedXLock::~ScopedXLock()
 //==============================================================================
 XWindowSystemUtilities::Atoms::Atoms (::Display* display)
 {
-    protocols                    = getIfExists (display, "WM_PROTOCOLS");
+    protocols                    = getCreating (display, "WM_PROTOCOLS");
     protocolList [TAKE_FOCUS]    = getIfExists (display, "WM_TAKE_FOCUS");
     protocolList [DELETE_WINDOW] = getIfExists (display, "WM_DELETE_WINDOW");
     protocolList [PING]          = getIfExists (display, "_NET_WM_PING");
     protocolList [SYNC_REQUEST]  = getIfExists (display, "_NET_WM_SYNC_REQUEST");
-    xSyncCounter                 = getIfExists (display, "_NET_WM_SYNC_REQUEST_COUNTER");
+    xSyncCounter                 = getCreating (display, "_NET_WM_SYNC_REQUEST_COUNTER");
     changeState                  = getIfExists (display, "WM_CHANGE_STATE");
     state                        = getIfExists (display, "WM_STATE");
     activeWin                    = getCreating (display, "_NET_ACTIVE_WINDOW");
@@ -115,7 +115,7 @@ XWindowSystemUtilities::Atoms::Atoms (::Display* display)
     windowState                  = getIfExists (display, "_NET_WM_STATE");
     windowStateHidden            = getIfExists (display, "_NET_WM_STATE_HIDDEN");
 
-    GTKFrameExtents              = getIfExists (display, "_GTK_FRAME_EXTENTS");
+    GTKFrameExtents              = getCreating (display, "_GTK_FRAME_EXTENTS");
 
     XdndAware                    = getCreating (display, "XdndAware");
     XdndEnter                    = getCreating (display, "XdndEnter");
@@ -178,6 +178,9 @@ bool XWindowSystemUtilities::Atoms::isMimeTypeFile (::Display* display, Atom ato
 XWindowSystemUtilities::GetXProperty::GetXProperty (::Display* display, Window window, Atom atom,
                                                     long offset, long length, bool shouldDelete, Atom requestedType)
 {
+    if (atom == None)
+        return;
+
     success = (X11Symbols::getInstance()->xGetWindowProperty (display, window, atom, offset, length,
                                                               (Bool) shouldDelete, requestedType, &actualType,
                                                               &actualFormat, &numItems, &bytesLeft, &data) == Success)
@@ -3056,7 +3059,7 @@ void XWindowSystem::removeWindowDecorations (::Window windowH) const
 
     hints = XWindowSystemUtilities::Atoms::getIfExists (display, "_KDE_NET_WM_WINDOW_TYPE_OVERRIDE");
 
-    if (hints != None)
+    if (hints != None && atoms.windowType != None)
     {
         XWindowSystemUtilities::ScopedXLock xLock;
         xchangeProperty (windowH, atoms.windowType, XA_ATOM, 32, &hints, 1);
