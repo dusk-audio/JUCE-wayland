@@ -170,27 +170,16 @@ public:
                                                                         (int) clientMsg.data.l[2] & 0xffff));
         const auto dropPos = detail::ScalingHelpers::screenPosToLocalPos (peer->getComponent(), logicalPos.toFloat()).roundToInt();
 
-        const auto& atoms = getAtoms();
-
-        auto targetAction = atoms.XdndActionCopy;
-
-        for (int i = numElementsInArray (atoms.allowedActions); --i >= 0;)
-        {
-            if ((Atom) clientMsg.data.l[4] == atoms.allowedActions[i])
-            {
-                targetAction = atoms.allowedActions[i];
-                break;
-            }
-        }
-
-        sendDragAndDropStatus (true, targetAction);
+        // A drop hands the component paths and never moves, links or deletes the
+        // source's data, so copying is the only action to accept or report.
+        sendDragAndDropStatus (true, getAtoms().XdndActionCopy);
 
         if (dragInfo.position != dropPos)
         {
             dragInfo.position = dropPos;
 
             if (dragInfo.isEmpty())
-                updateDraggedFileList (clientMsg, (::Window) peer->getNativeHandle());
+                updateDraggedFileList ((::Time) clientMsg.data.l[3], (::Window) peer->getNativeHandle());
 
             if (! dragInfo.isEmpty())
                 peer->handleDragMove (dragInfo);
@@ -203,7 +192,7 @@ public:
         {
             // no data, transaction finished in handleDragAndDropSelection()
             finishAfterDropDataReceived = true;
-            updateDraggedFileList (clientMsg, (::Window) peer->getNativeHandle());
+            updateDraggedFileList ((::Time) clientMsg.data.l[2], (::Window) peer->getNativeHandle());
         }
         else
         {
@@ -219,11 +208,16 @@ public:
         dragAndDropCurrentMimeType = 0;
         auto dndCurrentVersion = (static_cast<unsigned long> (clientMsg.data.l[1]) & 0xff000000) >> 24;
 
-        if (dndCurrentVersion < 3 || dndCurrentVersion > XWindowSystemUtilities::Atoms::DndVersion)
+        // Mutter relays a Wayland client's drag to an XWayland window at version 5,
+        // whatever XdndAware advertises. Version 5 only adds the XdndFinished
+        // fields that sendDragAndDropFinish() fills in.
+        if (dndCurrentVersion < 3 || dndCurrentVersion > 5)
         {
             dragAndDropSourceWindow = 0;
             return;
         }
+
+        dragAndDropSourceVersion = dndCurrentVersion;
 
         const auto& atoms = getAtoms();
 
@@ -276,7 +270,10 @@ public:
                 if (srcMimeTypeAtomList[i] == atoms.allowedMimeTypes[j])
                     dragAndDropCurrentMimeType = atoms.allowedMimeTypes[j];
 
-        handleDragAndDropPosition (clientMsg, peer);
+        // XdndEnter carries type atoms where XdndPosition carries the pointer and
+        // timestamp, so the source's first XdndPosition places the drag.
+        if (windowH == 0)
+            windowH = (::Window) peer->getNativeHandle();
     }
 
     void handleDragAndDropExit()
@@ -506,10 +503,17 @@ private:
         zerostruct (msg);
 
         msg.message_type = getAtoms().XdndFinished;
+
+        if (dragAndDropSourceVersion >= 5)
+        {
+            msg.data.l[1] = 1;
+            msg.data.l[2] = (long) getAtoms().XdndActionCopy;
+        }
+
         sendDragAndDropMessage (msg);
     }
 
-    void updateDraggedFileList (const XClientMessageEvent& clientMsg, ::Window requestor)
+    void updateDraggedFileList (::Time time, ::Window requestor)
     {
         jassert (dragInfo.isEmpty());
 
@@ -520,7 +524,7 @@ private:
             XWindowSystemUtilities::ScopedXLock xLock;
             X11Symbols::getInstance()->xConvertSelection (display, getAtoms().XdndSelection, dragAndDropCurrentMimeType,
                                                           XWindowSystemUtilities::Atoms::getCreating (display, "JXSelectionWindowProperty"),
-                                                          requestor, (::Time) clientMsg.data.l[2]);
+                                                          requestor, time);
         }
     }
 
@@ -592,6 +596,7 @@ private:
         dragInfo.position = Point<int> (-1, -1);
         dragAndDropCurrentMimeType = 0;
         dragAndDropSourceWindow = 0;
+        dragAndDropSourceVersion = 0;
         srcMimeTypeAtomList.clear();
         finishAfterDropDataReceived = false;
     }
@@ -600,6 +605,7 @@ private:
     ::Window windowH = 0, targetWindow = 0, dragAndDropSourceWindow = 0;
 
     int xdndVersion = -1;
+    unsigned long dragAndDropSourceVersion = 0;
     bool isText = false, dragging = false, expectingStatus = false, canDrop = false, finishAfterDropDataReceived = false;
 
     Atom dragAndDropCurrentMimeType;
