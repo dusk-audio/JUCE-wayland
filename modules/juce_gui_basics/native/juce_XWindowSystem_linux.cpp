@@ -1681,7 +1681,11 @@ static int getAllEventsMask (bool ignoresMouseClicks)
         X11Symbols::getInstance()->xiSelectEvents(display, windowH, &evmask, 1);
     //}
 
-    setFrameExtents(windowH, true);
+    // Only a window that draws its own frame has a shadow to inset: on a window with a native
+    // title bar the extents tell the window manager that the client decorates itself, and
+    // KWin then draws no title bar or buttons
+    if ((styleFlags & ComponentPeer::windowHasTitleBar) == 0)
+        setFrameExtents(windowH, true);
 
     return windowH;
 }
@@ -2090,8 +2094,6 @@ bool XWindowSystem::isMinimised (::Window w) const
 
 void XWindowSystem::setMaximised (::Window windowH, bool shouldBeMaximised) const
 {
-    setFrameExtents(windowH, !shouldBeMaximised);
-
     const auto root = X11Symbols::getInstance()->xRootWindow (display, X11Symbols::getInstance()->xDefaultScreen (display));
 
     XEvent ev;

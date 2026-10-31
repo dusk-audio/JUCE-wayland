@@ -94,7 +94,7 @@ public:
 
     void handleScreenSizeChange() override
     {
-        if (!isFullScreen()) {
+        if (!isFullScreen() && (styleFlags & windowHasTitleBar) == 0) {
             XWindowSystem::getInstance()->setFrameExtents(windowH, true);
         }
     }
