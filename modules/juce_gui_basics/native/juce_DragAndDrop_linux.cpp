@@ -265,6 +265,14 @@ public:
             }
         }
 
+        // GTK sources such as GNOME Files list text/plain;charset=utf-8 before
+        // text/uri-list, and taking the first match would hand the drop over as
+        // text. A source offering a file list is always read as files.
+        const auto uriList = XWindowSystemUtilities::Atoms::getCreating (getDisplay(), "text/uri-list");
+
+        if (srcMimeTypeAtomList.contains (uriList))
+            dragAndDropCurrentMimeType = uriList;
+
         for (int i = 0; i < srcMimeTypeAtomList.size() && dragAndDropCurrentMimeType == 0; ++i)
             for (int j = 0; j < numElementsInArray (atoms.allowedMimeTypes); ++j)
                 if (srcMimeTypeAtomList[i] == atoms.allowedMimeTypes[j])
