@@ -3392,6 +3392,26 @@ bool XWindowSystem::initialiseXDisplay()
 
 void XWindowSystem::initialiseXI2Devices()
 {
+    // Windows take button and motion events from every device and drop the ones
+    // that are not pointers, so the list has to follow devices plugged in, or
+    // added by the X server, after startup.
+    unsigned char mask[XIMaskLen (XI_HierarchyChanged)] = { 0 };
+    XIEventMask evmask;
+    evmask.deviceid = XIAllDevices;
+    evmask.mask_len = sizeof (mask);
+    evmask.mask = mask;
+    XISetMask (evmask.mask, XI_HierarchyChanged);
+
+    X11Symbols::getInstance()->xiSelectEvents (display,
+                                               X11Symbols::getInstance()->xRootWindow (display, X11Symbols::getInstance()->xDefaultScreen (display)),
+                                               &evmask, 1);
+
+    updateMouseDevices();
+}
+
+void XWindowSystem::updateMouseDevices()
+{
+    XWindowSystemUtilities::ScopedXLock xLock;
     mouseDevices.clear();
 
     int dev_count = 0;
@@ -4092,6 +4112,12 @@ void XWindowSystem::xiMessageReceive (XEvent& ev)
     if (X11Symbols::getInstance()->xGetEventData(display, &ev.xcookie)) {
         if (ev.xcookie.type == GenericEvent) {
             XGenericEventCookie* xCookie = &ev.xcookie;
+
+            if (xCookie->evtype == XI_HierarchyChanged) {
+                updateMouseDevices();
+                goto bypass;
+            }
+
             XIDeviceEvent* event = reinterpret_cast<XIDeviceEvent*>(xCookie->data);
 
             // discard event if super key is held down

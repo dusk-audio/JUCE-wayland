@@ -297,6 +297,7 @@ private:
     void destroyXDisplay();
 
     void initialiseXI2Devices();
+    void updateMouseDevices();
 
     //==============================================================================
     ::Window getFocusWindow (::Window) const;
