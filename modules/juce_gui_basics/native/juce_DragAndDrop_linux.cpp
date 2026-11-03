@@ -82,7 +82,7 @@ static StringArray getLocalFilesFromUriList (const StringArray& lines)
 }
 
 //==============================================================================
-class X11DragState
+class X11DragState  : private Timer
 {
 public:
     X11DragState() = default;
@@ -231,6 +231,9 @@ public:
 
     void handleDragAndDropDrop (const XClientMessageEvent& clientMsg, ComponentPeer* peer)
     {
+        if (dragAndDropSourceWindow == 0)
+            return;
+
         if (dragInfo.isEmpty())
         {
             // no data, transaction finished in handleDragAndDropSelection()
@@ -245,8 +248,12 @@ public:
 
     void handleDragAndDropEnter (const XClientMessageEvent& clientMsg, ComponentPeer* peer)
     {
+        if (finishAfterDropDataReceived)
+            abandonDrop();
+
         dragInfo.clear();
         srcMimeTypeAtomList.clear();
+        conversionTimes.clear();
 
         dragAndDropCurrentMimeType = 0;
         auto dndCurrentVersion = (static_cast<unsigned long> (clientMsg.data.l[1]) & 0xff000000) >> 24;
@@ -327,6 +334,23 @@ public:
             windowH = (::Window) peer->getNativeHandle();
     }
 
+    void handleDragAndDropLeave (const XClientMessageEvent& clientMsg)
+    {
+        // Mutter's relay can send XdndLeave straight after XdndDrop, before the
+        // drop's data has arrived. The drop is still the source's last word, but
+        // a source that has left and never answers is given up after a while; one
+        // still in the drag may take as long as it needs.
+        if (finishAfterDropDataReceived && (::Window) clientMsg.data.l[0] == dragAndDropSourceWindow)
+        {
+            if (! isTimerRunning())
+                startTimer (dropDataTimeoutMs);
+
+            return;
+        }
+
+        handleDragAndDropExit();
+    }
+
     void handleDragAndDropExit()
     {
         if (auto* peer = getPeerFor (windowH))
@@ -337,8 +361,16 @@ public:
 
     void handleDragAndDropSelection (const XEvent& evt)
     {
-        dragInfo.clear();
+        // Only a reply to a conversion this drag asked for carries its data. A
+        // drop that finished on the reply to one request can still get the
+        // reply to the other, and a source that answers after its drag was
+        // abandoned would otherwise hand that drag's data to the next one.
+        if (dragAndDropSourceWindow == 0 || ! conversionTimes.contains (evt.xselection.time & 0xffffffffUL))
+            return;
 
+        // A refused conversion keeps what an earlier reply delivered. Emptied,
+        // the info would make a later exit leave a file target through the
+        // text path.
         if (evt.xselection.property != None)
         {
             StringArray lines;
@@ -367,6 +399,8 @@ public:
 
                 lines.addLines (dropData.toString());
             }
+
+            dragInfo.clear();
 
             if (XWindowSystemUtilities::Atoms::isMimeTypeFile (getDisplay(), dragAndDropCurrentMimeType))
             {
@@ -541,14 +575,14 @@ private:
         sendExternalDragAndDropMessage (msg);
     }
 
-    void sendDragAndDropFinish()
+    void sendDragAndDropFinish (bool accepted)
     {
         XClientMessageEvent msg;
         zerostruct (msg);
 
         msg.message_type = getAtoms().XdndFinished;
 
-        if (dragAndDropSourceVersion >= 5)
+        if (dragAndDropSourceVersion >= 5 && accepted)
         {
             msg.data.l[1] = 1;
             msg.data.l[2] = (long) getAtoms().XdndActionCopy;
@@ -561,6 +595,11 @@ private:
     {
         jassert (dragInfo.isEmpty());
 
+        // XdndPosition and XdndDrop carry the time in a ClientMessage long, which
+        // Xlib sign-extends, and a SelectionNotify's time arrives zero-extended.
+        // Past 2^31 ms of server time the two only match on the low 32 bits.
+        time &= 0xffffffffUL;
+
         if (dragAndDropSourceWindow != None && dragAndDropCurrentMimeType != None)
         {
             auto* display = getDisplay();
@@ -569,6 +608,7 @@ private:
             X11Symbols::getInstance()->xConvertSelection (display, getAtoms().XdndSelection, dragAndDropCurrentMimeType,
                                                           XWindowSystemUtilities::Atoms::getCreating (display, "JXSelectionWindowProperty"),
                                                           requestor, time);
+            conversionTimes.addIfNotAlreadyThere (time);
         }
     }
 
@@ -626,7 +666,7 @@ private:
     {
         ComponentPeer::DragInfo dragInfoCopy (dragInfo);
 
-        sendDragAndDropFinish();
+        sendDragAndDropFinish (! dragInfoCopy.isEmpty());
         resetDragAndDrop();
 
         if (! dragInfoCopy.isEmpty())
@@ -634,18 +674,37 @@ private:
                 peer->handleDragDrop (dragInfoCopy);
     }
 
+    // A source that left and never answered still has to hear that the drop is over.
+    void timerCallback() override
+    {
+        abandonDrop();
+    }
+
+    void abandonDrop()
+    {
+        if (auto* peer = getPeerFor (windowH))
+            peer->handleDragExit (dragInfo);
+
+        sendDragAndDropFinish (false);
+        resetDragAndDrop();
+    }
+
     void resetDragAndDrop()
     {
+        stopTimer();
         dragInfo.clear();
         dragInfo.position = Point<int> (-1, -1);
         dragAndDropCurrentMimeType = 0;
         dragAndDropSourceWindow = 0;
         dragAndDropSourceVersion = 0;
         srcMimeTypeAtomList.clear();
+        conversionTimes.clear();
         finishAfterDropDataReceived = false;
     }
 
     //==============================================================================
+    static constexpr int dropDataTimeoutMs = 3000;
+
     ::Window windowH = 0, targetWindow = 0, dragAndDropSourceWindow = 0;
 
     int xdndVersion = -1;
@@ -654,6 +713,7 @@ private:
 
     Atom dragAndDropCurrentMimeType;
     Array<Atom> allowedTypes, srcMimeTypeAtomList;
+    Array<::Time> conversionTimes;
 
     ComponentPeer::DragInfo dragInfo;
     Rectangle<int> silentRect;

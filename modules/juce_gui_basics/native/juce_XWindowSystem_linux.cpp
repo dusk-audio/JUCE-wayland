@@ -4049,7 +4049,7 @@ void XWindowSystem::handleClientMessageEvent (LinuxComponentPeer* peer, XClientM
     }
     else if (clientMsg.message_type == atoms.XdndLeave)
     {
-        dragAndDropStateMap[peer].handleDragAndDropExit();
+        dragAndDropStateMap[peer].handleDragAndDropLeave (clientMsg);
     }
     else if (clientMsg.message_type == atoms.XdndPosition)
     {
