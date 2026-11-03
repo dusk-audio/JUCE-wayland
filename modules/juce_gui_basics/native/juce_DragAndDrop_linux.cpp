@@ -38,6 +38,49 @@ namespace juce
 static Cursor createDraggingHandCursor();
 ComponentPeer* getPeerFor (::Window);
 
+// RFC 2483 allows comment lines in a uri-list, and a browser's link drag offers
+// one too, so only a file: URI that names this machine becomes a file.
+static StringArray getLocalFilesFromUriList (const StringArray& lines)
+{
+    StringArray files;
+
+    for (const auto& entry : lines)
+    {
+        const auto line = entry.trim();
+
+        if (line.startsWithChar ('#') || ! line.startsWithIgnoreCase ("file:"))
+            continue;
+
+        auto path = line.substring (5);
+
+        if (path.startsWith ("//"))
+        {
+            const auto pathStart = path.indexOfChar (2, '/');
+
+            if (pathStart < 0)
+                continue;
+
+            const auto host = path.substring (2, pathStart);
+
+            if (host.isNotEmpty()
+                && ! host.equalsIgnoreCase ("localhost")
+                && ! host.equalsIgnoreCase (SystemStats::getComputerName()))
+                continue;
+
+            path = path.substring (pathStart);
+        }
+
+        if (! path.startsWithChar ('/'))
+            continue;
+
+        // removeEscapeChars reads '+' as a space, the form-encoding rule, which
+        // a file URI does not follow.
+        files.add (URL::removeEscapeChars (path.replace ("+", "%2B")));
+    }
+
+    return files;
+}
+
 //==============================================================================
 class X11DragState
 {
@@ -327,14 +370,7 @@ public:
 
             if (XWindowSystemUtilities::Atoms::isMimeTypeFile (getDisplay(), dragAndDropCurrentMimeType))
             {
-                for (const auto& line : lines)
-                {
-                    const auto escaped = line.replace ("+", "%2B").replace ("file://", String(), true);
-                    dragInfo.files.add (URL::removeEscapeChars (escaped));
-                }
-
-                dragInfo.files.trim();
-                dragInfo.files.removeEmptyStrings();
+                dragInfo.files = getLocalFilesFromUriList (lines);
             }
             else
             {
