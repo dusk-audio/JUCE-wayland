@@ -410,22 +410,28 @@ struct NodesFree
 using OwningNodes    = NodesImpl<OwningPtrTraits<LilvNodes, NodesFree>>;
 using NonOwningNodes = NodesImpl<NonOwningPtrTraits<LilvNodes>>;
 
+struct ScalePointsFree
+{
+    void operator() (LilvScalePoints* ptr) const noexcept { lilv_scale_points_free (ptr); }
+};
+
+// lilv_port_get_scale_points hands the caller a collection to free.
 class ScalePoints
 {
 public:
-    explicit ScalePoints (const LilvScalePoints* pt)
+    explicit ScalePoints (LilvScalePoints* pt)
         : points (pt) {}
 
     ScalePointsIterator begin() const noexcept
     {
         return points == nullptr ? ScalePointsIterator{}
-                                 : ScalePointsIterator { points };
+                                 : ScalePointsIterator { points.get() };
     }
 
     ScalePointsIterator end() const noexcept { return {}; }
 
 private:
-    const LilvScalePoints* points = nullptr;
+    std::unique_ptr<LilvScalePoints, ScalePointsFree> points;
 };
 
 class ScalePoint
