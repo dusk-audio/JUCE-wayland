@@ -4231,6 +4231,16 @@ public:
                 world->loadBundle (world->newFileUri (nullptr, pathString.toRawUTF8()));
             }
         }
+
+        // The class table was built before the embedded specifications loaded. It is
+        // built again only when the search found no specifications of its own: a
+        // rebuild re-creates every class already in it, and lilv 0.24.12 leaks each
+        // duplicate.
+        if (world->getPluginClasses().size() == 0)
+        {
+            world->loadSpecifications();
+            world->loadPluginClasses();
+        }
     }
 
     ~Pimpl()
