@@ -3,6 +3,8 @@
  // Distributed under the GPLv3 license
  */
 
+#include "juce_WaylandInputState.h"
+
 namespace juce
 {
 
@@ -120,6 +122,7 @@ struct WaylandDisplay {
 };
 
 WaylandWindowSystem::WaylandWindowSystem()
+    : inputState (std::make_unique<WaylandInputState>())
 {
     if (initialised) return;
     
@@ -523,6 +526,7 @@ void WaylandWindowSystem::updateConstraints (WaylandWindow* window) const
 
 void WaylandWindowSystem::destroyWindow (WaylandWindow* window)
 {
+    forgetInputSurface (window->surface);
     if (hasTouch)
         currentTouches->deleteAllTouchesForPeer (window->peer);
     
@@ -951,6 +955,27 @@ bool WaylandWindowSystem::isTouchAvailable()
   return hasTouch;
 }
 
+uint64 WaylandWindowSystem::attachInputForwarder (const InputForwarder& forwarder)
+{
+    if (! initialised)
+        return 0;
+    const auto token = inputState->attach (forwarder);
+    if (inputState->hasKeyboardFocus())
+        keyRepeater.stopTimer();
+    return token;
+}
+
+void WaylandWindowSystem::detachInputForwarder (uint64 registration)
+{
+    if (inputState->detach (registration))
+        inputState->forgetForeignSurfaces ([this] (wl_surface* surface) { return findWindowBySurface (surface) != nullptr; });
+}
+
+void WaylandWindowSystem::forgetInputSurface (wl_surface* surface)
+{
+    inputState->forgetSurface (surface);
+}
+
 void WaylandWindowSystem::setupGlobalInput()
 {
     if (! seat)
@@ -959,14 +984,19 @@ void WaylandWindowSystem::setupGlobalInput()
     // Keyboard setup
     static const wl_keyboard_listener keyboardListener =
     {
-        .keymap = [] (void* data, wl_keyboard*, uint32, int32 fd, uint32 size)
+        .keymap = [] (void* data, wl_keyboard* proxy, uint32 format, int32 fd, uint32 size)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
-            self->setupKeymap (fd, size);
+            self->inputState->keymap (proxy, format, fd, size);
+            if (format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1)
+                self->setupKeymap (fd, size);
         },
-        .enter = [] (void* data, wl_keyboard*, uint32, wl_surface* surface, wl_array*)
+        .enter = [] (void* data, wl_keyboard* proxy, uint32 serial, wl_surface* surface, wl_array* keys)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
+            self->inputState->keyboardEnter (proxy, serial, surface, keys);
+            if (self->inputState->hasKeyboardFocus())
+                self->keyRepeater.stopTimer();
             if (auto* window = self->findWindowBySurface (surface))
             {
                 if (! window->ignoresKeyboard) {
@@ -977,14 +1007,16 @@ void WaylandWindowSystem::setupGlobalInput()
                 if (! self->lastFocusedWindow) self->lastFocusedWindow = (window->parentWindow || ! window->isVisible) ? self->lastFocusedWindow : window;
             }
         },
-        .leave = [] (void* data, wl_keyboard*, uint32, wl_surface* surface)
+        .leave = [] (void* data, wl_keyboard* proxy, uint32 serial, wl_surface* surface)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
+            const auto forwardedFocus = self->inputState->hasKeyboardFocus();
+            self->inputState->keyboardLeave (proxy, serial, surface);
             WaylandWindow* window = self->findWindowBySurface (surface);
             if (! self->keysCurrentlyDown.empty())
             {
                 self->keysCurrentlyDown.clear();
-                if (self->keyboardFocused)
+                if (self->keyboardFocused && ! forwardedFocus)
                     self->keyboardFocused->peer->handleKeyUpOrDown (false);
             }
             self->keyRepeater.stopTimer();
@@ -993,39 +1025,49 @@ void WaylandWindowSystem::setupGlobalInput()
                 window->peer->handleFocusLoss();
             }
         },
-        .key = [] (void* data, wl_keyboard*, uint32, uint32, uint32 key, uint32 state)
+        .key = [] (void* data, wl_keyboard* proxy, uint32 serial, uint32 time, uint32 key, uint32 state)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
-            if (auto* window = self->keyboardFocused)
-                self->handleKeyEvent (window, key, state == WL_KEYBOARD_KEY_STATE_PRESSED);
+            self->currentMouseSerial = serial;
+            const auto consumed = self->inputState->key (proxy, serial, time, key, state);
+            if (consumed || self->inputState->hasKeyboardFocus())
+                self->keyRepeater.stopTimer();
+            self->handleKeyEvent (self->keyboardFocused, key, state == WL_KEYBOARD_KEY_STATE_PRESSED, ! consumed);
         },
-        .modifiers = [] (void* data, wl_keyboard*, uint32, uint32 depressed, uint32 latched, uint32 locked, uint32 group)
+        .modifiers = [] (void* data, wl_keyboard* proxy, uint32 serial, uint32 depressed, uint32 latched, uint32 locked, uint32 group)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
-            if (auto* window = self->keyboardFocused)
+            self->inputState->modifiers (proxy, serial, depressed, latched, locked, group);
+            if (self->xkbState)
+                WaylandSymbols::getInstance()->xkbStateUpdateMask (self->xkbState, depressed, latched, locked, 0, 0, group);
+
+            ModifierKeys::currentModifiers = self->getNativeRealtimeModifiers();
+            if (self->inputState->hasKeyboardFocus())
+                self->keyRepeater.stopTimer();
+            else if (auto* window = self->keyboardFocused)
             {
-                if (self->xkbState)
-                    WaylandSymbols::getInstance()->xkbStateUpdateMask (self->xkbState, depressed, latched, locked, 0, 0, group);
-                
-                ModifierKeys::currentModifiers = self->getNativeRealtimeModifiers();
                 window->peer->handleModifierKeysChange();
                 window->peer->handleKeyUpOrDown (depressed);
             }
         },
-        .repeat_info = [] (void* data, wl_keyboard*, int32 rate, int32 delay)
+        .repeat_info = [] (void* data, wl_keyboard* proxy, int32 rate, int32 delay)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
             self->keyRepeatRate = rate;
             self->keyRepeatDelay = delay;
+            self->inputState->repeatInfo (proxy, rate, delay);
         }
     };
     
     // Pointer setup
     static const wl_pointer_listener pointerListener =
     {
-        .enter = [] (void* data, wl_pointer*, uint32 serial, wl_surface* surface, wl_fixed_t x, wl_fixed_t y)
+        .enter = [] (void* data, wl_pointer* proxy, uint32 serial, wl_surface* surface, wl_fixed_t x, wl_fixed_t y)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
+            self->currentMouseSerial = serial;
+            self->pointerFocused = nullptr;
+            self->inputState->pointerEnter (proxy, serial, surface, x, y);
             if (auto* window = self->findWindowBySurface (surface))
             {
                 self->currentMousePosition = window->peer->localToGlobal (WaylandSymbols::getInstance()->fixedToPoint<float>(x, y));
@@ -1038,28 +1080,32 @@ void WaylandWindowSystem::setupGlobalInput()
                 self->handleMouseEvent (window);
             }
         },
-        .leave = [] (void* data, wl_pointer*, uint32, wl_surface* surface)
+        .leave = [] (void* data, wl_pointer* proxy, uint32 serial, wl_surface* surface)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
+            self->inputState->pointerLeave (proxy, serial, surface);
 
             // Send mouse-up events for any held mouse buttons
             if (ModifierKeys::currentModifiers.isLeftButtonDown())
             {
                 self->updateMouseModifiers (BTN_LEFT, false);
-                if (auto* window = self->findWindowBySurface (surface))
-                  self->handleMouseEvent (window);
+                if (! self->inputState->isButtonConsumed (BTN_LEFT))
+                    if (auto* window = self->findWindowBySurface (surface))
+                        self->handleMouseEvent (window);
             }
             if (ModifierKeys::currentModifiers.isRightButtonDown())
             {
                 self->updateMouseModifiers (BTN_RIGHT, false);
-                if (auto* window = self->findWindowBySurface (surface))
-                  self->handleMouseEvent (window);
+                if (! self->inputState->isButtonConsumed (BTN_RIGHT))
+                    if (auto* window = self->findWindowBySurface (surface))
+                        self->handleMouseEvent (window);
             }
             if (ModifierKeys::currentModifiers.isMiddleButtonDown())
             {
                 self->updateMouseModifiers (BTN_MIDDLE, false);
-                if (auto* window = self->findWindowBySurface (surface))
-                  self->handleMouseEvent (window);
+                if (! self->inputState->isButtonConsumed (BTN_MIDDLE))
+                    if (auto* window = self->findWindowBySurface (surface))
+                        self->handleMouseEvent (window);
             }
 
             if (auto* window = self->findWindowBySurface (surface))
@@ -1075,9 +1121,10 @@ void WaylandWindowSystem::setupGlobalInput()
             }
             self->pointerFocused = nullptr;
         },
-        .motion = [] (void* data, wl_pointer*, uint32 time, wl_fixed_t x, wl_fixed_t y)
+        .motion = [] (void* data, wl_pointer* proxy, uint32 time, wl_fixed_t x, wl_fixed_t y)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
+            self->inputState->pointerMotion (proxy, time, x, y);
             if (auto* window = self->pointerFocused)
             {
                 self->currentMouseTime = time;
@@ -1085,14 +1132,22 @@ void WaylandWindowSystem::setupGlobalInput()
                 self->handleMouseEvent (window);
             }
         },
-        .button = [] (void* data, wl_pointer*, uint32 serial, uint32 time, uint32 button, uint32 state)
+        .button = [] (void* data, wl_pointer* proxy, uint32 serial, uint32 time, uint32 button, uint32 state)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
+            self->currentMouseSerial = serial;
+            self->currentMouseTime = time;
+            const auto pressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
+            const auto consumed = self->inputState->button (proxy, serial, time, button, state);
+            self->updateMouseModifiers (button, pressed);
+            if (self->inputState->hasKeyboardFocus())
+                self->keyRepeater.stopTimer();
+            if (consumed)
+                return;
+            if (pressed && self->pointerFocused)
+                self->inputState->releaseFocus();
             if (auto* window = self->pointerFocused)
             {
-                self->currentMouseSerial = serial;
-                self->currentMouseTime = time;
-                bool pressed = (state == WL_POINTER_BUTTON_STATE_PRESSED);
                 
                 // Subsurfaces don't get a configure callback, so we need to keep track of activation manually
                 if (pressed && window->parentWindow && ! window->isActivated)
@@ -1104,13 +1159,13 @@ void WaylandWindowSystem::setupGlobalInput()
                     window->peer->handleBroughtToFront();
                 }
                 
-                self->updateMouseModifiers (button, pressed);
                 self->handleMouseEvent (window);
             }
         },
-        .axis = [] (void* data, wl_pointer*, uint32 time, uint32 axis, wl_fixed_t value)
+        .axis = [] (void* data, wl_pointer* proxy, uint32 time, uint32 axis, wl_fixed_t value)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
+            self->inputState->pointerEvent (&wl_pointer_listener::axis, proxy, time, axis, value);
             if (auto* window = self->pointerFocused)
             {
                 self->currentMouseTime = time;
@@ -1127,10 +1182,18 @@ void WaylandWindowSystem::setupGlobalInput()
                 window->peer->handleMouseWheel (MouseInputSource::InputSourceType::mouse, localPos, time, wheel);
             }
         },
-        .frame = [] (void*, wl_pointer*) {},
-        .axis_source = [] (void*, wl_pointer*, uint32) {},
-        .axis_stop = [] (void*, wl_pointer*, uint32, uint32) {},
-        .axis_discrete = [] (void *, wl_pointer*, uint32, int32) {}
+        .frame = [] (void* data, wl_pointer* proxy) {
+            static_cast<WaylandWindowSystem*> (data)->inputState->pointerEvent (&wl_pointer_listener::frame, proxy);
+        },
+        .axis_source = [] (void* data, wl_pointer* proxy, uint32 source) {
+            static_cast<WaylandWindowSystem*> (data)->inputState->pointerEvent (&wl_pointer_listener::axis_source, proxy, source);
+        },
+        .axis_stop = [] (void* data, wl_pointer* proxy, uint32 time, uint32 axis) {
+            static_cast<WaylandWindowSystem*> (data)->inputState->pointerEvent (&wl_pointer_listener::axis_stop, proxy, time, axis);
+        },
+        .axis_discrete = [] (void* data, wl_pointer* proxy, uint32 axis, int32 discrete) {
+            static_cast<WaylandWindowSystem*> (data)->inputState->pointerEvent (&wl_pointer_listener::axis_discrete, proxy, axis, discrete);
+        }
     };
     
     // Touch setup
@@ -1454,7 +1517,7 @@ void WaylandWindowSystem::handleMouseEvent (WaylandWindow* window)
     auto localPos = window->peer->globalToLocal (currentMousePosition);
     window->peer->handleMouseEvent (MouseInputSource::InputSourceType::mouse,
                                     localPos,
-                                    ModifierKeys::currentModifiers,
+                                    inputState->hostMouseModifiers (ModifierKeys::currentModifiers),
                                     MouseInputSource::defaultPressure,  // Default pressure
                                     MouseInputSource::defaultOrientation, // Default orientation
                                     currentMouseTime);
@@ -1517,8 +1580,11 @@ void WaylandWindowSystem::handleTouchEvent (WaylandWindow* window, Point<float> 
     }
 }
 
-void WaylandWindowSystem::handleKeyEvent (WaylandWindow* window, uint32 waylandKey, bool pressed)
+void WaylandWindowSystem::handleKeyEvent (WaylandWindow* window, uint32 waylandKey, bool pressed, bool dispatchToWidgets)
 {
+    if (! xkbState)
+        return;
+
     auto xkbKeyCode = static_cast<xkb_keycode_t>(waylandKey + 8);
     xkb_keysym_t keysym = WaylandSymbols::getInstance()->xkbStateKeyGetOneSym (xkbState, xkbKeyCode);
     
@@ -1614,9 +1680,12 @@ void WaylandWindowSystem::handleKeyEvent (WaylandWindow* window, uint32 waylandK
     
     if (pressed)
     {
-        lastKey = {juceKeyCode, textChar};
         keysCurrentlyDown.insert (juceKeyCode);
-        keyRepeater.startTimer (keyRepeatDelay);
+        if (dispatchToWidgets && window && keyRepeatRate > 0)
+        {
+            lastKey = {juceKeyCode, textChar};
+            keyRepeater.startTimer (keyRepeatDelay);
+        }
     }
     else
     {
@@ -1625,6 +1694,9 @@ void WaylandWindowSystem::handleKeyEvent (WaylandWindow* window, uint32 waylandK
             keyRepeater.stopTimer();
     }
     
+    if (! dispatchToWidgets || ! window)
+        return;
+
     if (oldMods != ModifierKeys::currentModifiers)
         window->peer->handleModifierKeysChange();
     
@@ -1636,6 +1708,11 @@ void WaylandWindowSystem::handleKeyEvent (WaylandWindow* window, uint32 waylandK
 
 void WaylandWindowSystem::handleKeyRepeat()
 {
+    if (inputState->hasKeyboardFocus())
+    {
+        keyRepeater.stopTimer();
+        return;
+    }
     if (keyboardFocused)
     {
         if (isKeyCurrentlyDown (lastKey.first))
@@ -2130,3 +2207,7 @@ void processWaylandFd()
 }
 
 } // namespace juce
+
+#if JUCE_UNIT_TESTS
+ #include "juce_WaylandInput_test.cpp"
+#endif

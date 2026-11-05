@@ -6,6 +6,7 @@
 namespace juce
 {
 
+struct WaylandInputState;
 struct WaylandWindow;
 struct WaylandDisplay;
 struct WaylandShmBuffer;
@@ -29,6 +30,28 @@ enum class MouseEventFlags
 class WaylandWindowSystem : public DeletedAtShutdown
 {
 public:
+    struct InputForwarder
+    {
+        const wl_keyboard_listener* keyboard = nullptr;
+        const wl_pointer_listener* pointer = nullptr;
+        void* data = nullptr;
+        bool (*consumed) (void*) = nullptr;
+        bool (*hasKeyboardFocus) (void*) = nullptr;
+        void (*releaseFocus) (void*) = nullptr;
+        void (*reset) (void*) = nullptr;
+    };
+
+    // Message-thread only. The target must survive each callback, including reset.
+    // Listeners receive a duplicate keymap FD and must close it. Do not install
+    // these listeners on the host's proxies. Detach before destroying the target.
+    // consumed is queried only after key/button. Attach replays current input and
+    // returns zero on failure; only its returned token may detach that registration.
+    // Forget an embedded surface before destroying it to prevent stale focus replay.
+    uint64 attachInputForwarder (const InputForwarder&);
+    void detachInputForwarder (uint64 registration);
+    void forgetInputSurface (wl_surface*);
+    wl_seat* getSeat() const noexcept { return seat; }
+
     bool isWaylandAvailable();
     bool isTouchAvailable();
 
@@ -136,16 +159,16 @@ private:
     // Input event handling
     void handleMouseEvent (WaylandWindow* window);
     void handleTouchEvent (WaylandWindow* window, Point<float> localPos, int touchIndex, MouseEventFlags eventType);
-    void handleKeyEvent (WaylandWindow* window, uint32_t waylandKey, bool pressed);
+    void handleKeyEvent (WaylandWindow* window, uint32_t waylandKey, bool pressed, bool dispatchToWidgets);
     void handleKeyRepeat();
     void updateMouseModifiers (uint32_t button, bool pressed);
     
-    wl_display* display;
-    wl_registry* registry;
-    wl_compositor* compositor;
-    wl_subcompositor* subcompositor;
-    wl_shm* shm;
-    wl_seat* seat;
+    wl_display* display = nullptr;
+    wl_registry* registry = nullptr;
+    wl_compositor* compositor = nullptr;
+    wl_subcompositor* subcompositor = nullptr;
+    wl_shm* shm = nullptr;
+    wl_seat* seat = nullptr;
     libdecor* decorator = nullptr;
     
     xkb_state* xkbState = nullptr;
@@ -170,14 +193,14 @@ private:
     WaylandWindow* lastFocusedWindow = nullptr;
     
     // Global input objects
-    wl_keyboard* globalKeyboard;
-    wl_pointer* globalPointer;
-    wl_touch* globalTouch;
+    wl_keyboard* globalKeyboard = nullptr;
+    wl_pointer* globalPointer = nullptr;
+    wl_touch* globalTouch = nullptr;
     
     TimedCallback keyRepeater = TimedCallback ([this](){ handleKeyRepeat(); });
     std::pair<int, juce_wchar> lastKey;
     std::set<int> keysCurrentlyDown;
-    int keyRepeatRate, keyRepeatDelay;
+    int keyRepeatRate = 0, keyRepeatDelay = 0;
     
     Point<float> currentMousePosition;
     uint32_t currentMouseSerial = 0;
@@ -210,6 +233,7 @@ private:
     String currentClipboardText;
     bool hasClipboardData = false;
   
+    std::unique_ptr<WaylandInputState> inputState;
     bool initialised = false;
   
 public:
