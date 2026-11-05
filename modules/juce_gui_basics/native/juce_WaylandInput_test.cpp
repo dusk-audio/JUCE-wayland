@@ -369,6 +369,28 @@ public:
             expect (! state.hasKeyboardFocus());
             state.detach (token);
         }
+
+        beginTest ("Pointer leave releases consumed buttons to the forwarder");
+        {
+            WaylandInputState state;
+            Recorder recorder;
+            auto* surface = reinterpret_cast<wl_surface*> (&recorder);
+            state.pointerEnter (nullptr, 1, surface, 0, 0);
+            const auto token = state.attach (recorder.forwarder());
+            recorder.consume = true;
+            expect (state.button (nullptr, 2, 3, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED));
+            recorder.consume = false;
+            recorder.events.clear();
+            recorder.buttons.clear();
+            state.pointerLeave (nullptr, 4, surface);
+            expect (recorder.events == std::vector<int> ({ 7, 6 }));
+            expect (recorder.buttons == std::vector<std::pair<uint32, uint32>> ({ { (uint32) BTN_LEFT, (uint32) WL_POINTER_BUTTON_STATE_RELEASED } }));
+            expect (state.hostMouseModifiers (ModifierKeys (ModifierKeys::leftButtonModifier)).isLeftButtonDown());
+            state.pointerEnter (nullptr, 5, surface, 0, 0);
+            expect (! state.button (nullptr, 6, 7, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED));
+            expect (! state.button (nullptr, 8, 9, BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED));
+            state.detach (token);
+        }
     }
 
 private:
@@ -376,6 +398,7 @@ private:
     {
         std::vector<int> events;
         std::vector<uint32> keys, modifiers;
+        std::vector<std::pair<uint32, uint32>> buttons;
         int keymapFd = -1, resets = 0, keyEvents = 0;
         wl_fixed_t x = 0, y = 0;
         bool keymapWasOpen = false, consume = false, focused = false;
@@ -428,8 +451,13 @@ private:
                     r.x = surfaceX;
                     r.y = surfaceY;
                 },
-                nullptr, nullptr,
-                [] (void*, wl_pointer*, uint32, uint32, uint32, uint32) {}
+                [] (void* data, wl_pointer*, uint32, wl_surface*) { static_cast<Recorder*> (data)->events.push_back (6); },
+                nullptr,
+                [] (void* data, wl_pointer*, uint32, uint32, uint32 button, uint32 state) {
+                    auto& r = *static_cast<Recorder*> (data);
+                    r.events.push_back (7);
+                    r.buttons.push_back ({ button, state });
+                }
             };
             return { &keyboard, &pointer, this,
                 [] (void* data) {

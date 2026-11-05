@@ -1244,7 +1244,6 @@ void WaylandWindowSystem::setupGlobalInput()
         .leave = [] (void* data, wl_pointer* proxy, uint32 serial, wl_surface* surface)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
-            self->inputState->pointerLeave (proxy, serial, surface);
 
             // Send mouse-up events for any held mouse buttons
             if (ModifierKeys::currentModifiers.isLeftButtonDown())
@@ -1268,6 +1267,8 @@ void WaylandWindowSystem::setupGlobalInput()
                     if (auto* window = self->findWindowBySurface (surface))
                         self->handleMouseEvent (window);
             }
+
+            self->inputState->pointerLeave (proxy, serial, surface);
 
             if (auto* window = self->findWindowBySurface (surface))
             {

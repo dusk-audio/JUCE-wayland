@@ -266,11 +266,15 @@ struct WaylandInputState
     {
         if (pointerSurface == surface)
             pointerSurface = nullptr;
+        for (const auto code : std::exchange (consumedButtons, {}))
+            pointerEvent (&wl_pointer_listener::button, proxy, serial, pointerTime, code,
+                          (uint32) WL_POINTER_BUTTON_STATE_RELEASED);
         pointerEvent (&wl_pointer_listener::leave, proxy, serial, surface);
     }
 
     void pointerMotion (wl_pointer* proxy, uint32 time, wl_fixed_t x, wl_fixed_t y)
     {
+        pointerTime = time;
         pointerX = x;
         pointerY = y;
         pointerEvent (&wl_pointer_listener::motion, proxy, time, x, y);
@@ -291,6 +295,7 @@ struct WaylandInputState
 
     bool button (wl_pointer* proxy, uint32 serial, uint32 time, uint32 code, uint32 state)
     {
+        pointerTime = time;
         const auto owned = consumedButtons.count (code) != 0;
         bool consumed = false;
         withForwarder ([&] (const Forwarder& target) {
@@ -382,7 +387,7 @@ private:
     wl_pointer* pointer = nullptr;
     wl_surface* keyboardSurface = nullptr;
     wl_surface* pointerSurface = nullptr;
-    uint32 keyboardSerial = 0, pointerSerial = 0, modifierSerial = 0;
+    uint32 keyboardSerial = 0, pointerSerial = 0, modifierSerial = 0, pointerTime = 0;
     uint32 depressedMods = 0, latchedMods = 0, lockedMods = 0, modifierGroup = 0;
     int32 repeatRate = 0, repeatDelay = 0;
     wl_fixed_t pointerX = 0, pointerY = 0;
