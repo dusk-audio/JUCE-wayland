@@ -2252,7 +2252,7 @@ void WaylandWindowSystem::readOfferData (wl_data_offer* offer, const String& mim
                                        std::function<void (const String&)> callback)
 {
     int pipeFds[2];
-    if (! offer || pipe (pipeFds) != 0) return;
+    if (! offer || pipe2 (pipeFds, O_CLOEXEC) != 0) return;
     WaylandPipeTransfer transfer (pipeFds[0]);
     const ScopedValueSetter<WaylandPipeTransfer*> active (activeTransfer, &transfer);
     WaylandSymbols::getInstance()->dataOfferReceive (offer, mimeType.toRawUTF8(), pipeFds[1]);
