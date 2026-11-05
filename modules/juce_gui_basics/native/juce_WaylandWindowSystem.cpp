@@ -2114,7 +2114,10 @@ void WaylandWindowSystem::updateCursor()
         cursorSurface = WaylandSymbols::getInstance()->compositorCreateSurface (compositor);
         currentCursor = createStandardMouseCursor (MouseCursor::NormalCursor);
     }
-    
+
+    if (! globalPointer)
+        return;
+
     if (currentCursor.standardCursor == -1)
     {
         auto& image = currentCursor.cursorImage;
