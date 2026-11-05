@@ -1380,9 +1380,6 @@ private:
               "\t\tui:resize ;\n"
               "\n"
               "\tlv2:requiredFeature\n"
-             #if JUCE_LINUX || JUCE_BSD
-              "\t\tui:idleInterface ,\n"
-             #endif
               "\t\turid:map ,\n"
               "\t\tui:parent ,\n"
               "\t\t<http://lv2plug.in/ns/ext/instance-access> ;\n"
