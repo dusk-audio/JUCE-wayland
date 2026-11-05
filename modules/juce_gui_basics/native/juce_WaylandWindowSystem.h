@@ -7,6 +7,7 @@ namespace juce
 {
 
 struct WaylandInputState;
+struct WaylandPipeTransfer;
 struct WaylandWindow;
 struct WaylandDisplay;
 struct WaylandShmBuffer;
@@ -154,7 +155,8 @@ private:
     // Drag and drop helpers
     void setupDragSource (WaylandWindow* window, bool isText, bool canMoveFiles);
     void writeDataToFd (int fd, const String& data) const;
-    void readOfferData (const String& mimeType, std::function<void (const String&)> callback) const            ;
+    void readOfferData (wl_data_offer*, const String& mimeType, std::function<void (const String&)> callback);
+    void releaseOffer (wl_data_offer*);
     
     // Z-order management
     void enforceOrder();
@@ -216,10 +218,10 @@ private:
     bool hasMouse = false;
     bool hasKeyboard = false;
     
-    wl_data_device_manager* dataDeviceManager;
-    wl_data_device* dataDevice;
-    wl_data_source* dragSource;
-    wl_data_source* clipboardSource;
+    wl_data_device_manager* dataDeviceManager = nullptr;
+    wl_data_device* dataDevice = nullptr;
+    wl_data_source* dragSource = nullptr;
+    wl_data_source* clipboardSource = nullptr;
     
     // For sending drag and drop
     std::function<void()> dragCompletionCallback;
@@ -228,14 +230,17 @@ private:
     
     // For receiving drag and drop
     ComponentPeer::DragInfo currentDragInfo;
-    wl_data_offer* currentOffer;
+    wl_data_offer* currentOffer = nullptr;
     WaylandWindow* dragTargetWindow = nullptr;
-    bool isDraggingText = false;
-    bool isDraggingFiles = false;
+    struct OfferTypes { String text; bool files = false; };
+    std::map<wl_data_offer*, OfferTypes> offers;
   
     // Clipboard state
     String currentClipboardText;
-    bool hasClipboardData = false;
+    String publishedClipboardText;
+    wl_data_offer* clipboardOffer = nullptr;
+    uint64 clipboardGeneration = 0;
+    WaylandPipeTransfer* activeTransfer = nullptr;
   
     std::unique_ptr<WaylandInputState> inputState;
     bool initialised = false;

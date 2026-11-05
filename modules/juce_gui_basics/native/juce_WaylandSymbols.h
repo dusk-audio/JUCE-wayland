@@ -384,6 +384,9 @@ public:
                                          void)
     
     // wl_data_source
+    JUCE_DECLARE_INLINE_FUNCTION (wl_data_source_destroy, dataSourceDestroy,
+                                         (wl_data_source*),
+                                         void)
     JUCE_DECLARE_INLINE_FUNCTION (wl_data_source_offer, dataSourceOffer,
                                          (wl_data_source*, const char*),
                                          void)

@@ -8,6 +8,143 @@
 namespace juce
 {
 
+struct WaylandPipeTransfer
+{
+    explicit WaylandPipeTransfer (int descriptor) : fd (descriptor)
+    {
+        const auto flags = fcntl (fd, F_GETFL, 0);
+        failed = flags < 0 || fcntl (fd, F_SETFL, flags | O_NONBLOCK) < 0;
+    }
+    ~WaylandPipeTransfer() { if (fd >= 0) close (fd); }
+    WaylandPipeTransfer (const WaylandPipeTransfer&) = delete;
+    WaylandPipeTransfer& operator= (const WaylandPipeTransfer&) = delete;
+
+    void drain()
+    {
+        char buffer[8192];
+        while (! complete && ! failed)
+        {
+            const auto count = read (fd, buffer, sizeof buffer);
+            if (count > 0)
+            {
+                if (bytes.size() + static_cast<size_t> (count) > 64u * 1024u * 1024u)
+                {
+                    failed = true;
+                    return;
+                }
+                try { bytes.insert (bytes.end(), buffer, buffer + count); }
+                catch (...) { failed = true; }
+            }
+            else if (count == 0)
+            {
+                complete = true;
+            }
+            else if (errno != EINTR)
+            {
+                failed = errno != EAGAIN && errno != EWOULDBLOCK;
+                return;
+            }
+        }
+    }
+
+    using Clock = std::chrono::steady_clock;
+    static int millisecondsLeft (Clock::time_point deadline)
+    {
+        return static_cast<int> (std::max<int64_t> (0,
+            std::chrono::duration_cast<std::chrono::milliseconds> (deadline - Clock::now()).count()));
+    }
+
+    bool receive (int timeoutMs = 1000)
+    {
+        const auto deadline = Clock::now() + std::chrono::milliseconds (timeoutMs);
+        while (! complete && ! failed)
+        {
+            drain();
+            if (complete || failed) break;
+            const auto remaining = millisecondsLeft (deadline);
+            if (remaining == 0) { failed = true; break; }
+            pollfd request { fd, POLLIN, 0 };
+            const auto result = poll (&request, 1, remaining);
+            if (result < 0 && errno == EINTR) continue;
+            if (result <= 0 || (request.revents & POLLNVAL)) failed = true;
+        }
+        return complete && ! failed;
+    }
+
+    static bool send (int descriptor, const char* data, size_t size,
+                      WaylandPipeTransfer* receiver, int timeoutMs = 1000)
+    {
+        struct CloseFd { int value; ~CloseFd() { close (value); } } owned { descriptor };
+        const auto flags = fcntl (descriptor, F_GETFL, 0);
+        if (flags < 0 || fcntl (descriptor, F_SETFL, flags | O_NONBLOCK) < 0) return false;
+
+        struct PipeSignal
+        {
+            PipeSignal()
+            {
+                sigemptyset (&onlyPipe);
+                sigaddset (&onlyPipe, SIGPIPE);
+                blocked = pthread_sigmask (SIG_BLOCK, &onlyPipe, &saved) == 0;
+                sigset_t pending;
+                alreadyPending = sigpending (&pending) != 0 || sigismember (&pending, SIGPIPE);
+            }
+            ~PipeSignal()
+            {
+                if (! blocked) return;
+                // Leave a caller-owned pending or blocked signal untouched.
+                if (broken && ! alreadyPending && ! sigismember (&saved, SIGPIPE))
+                {
+                    const timespec zero {};
+                    while (sigtimedwait (&onlyPipe, nullptr, &zero) < 0 && errno == EINTR) {}
+                }
+                pthread_sigmask (SIG_SETMASK, &saved, nullptr);
+            }
+            sigset_t saved {}, onlyPipe {};
+            bool blocked = false, alreadyPending = false, broken = false;
+        } signal;
+        if (! signal.blocked) return false;
+
+        const auto deadline = Clock::now() + std::chrono::milliseconds (timeoutMs);
+        size_t offset = 0;
+        while (offset < size)
+        {
+            if (millisecondsLeft (deadline) == 0) return false;
+            const auto written = write (descriptor, data + offset, size - offset);
+            if (written > 0)
+            {
+                offset += static_cast<size_t> (written);
+                continue;
+            }
+            if (written < 0 && errno == EINTR) continue;
+            if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            {
+                // A self-paste cannot resume its receive loop until this callback returns.
+                const bool drainReceiver = receiver && ! receiver->complete && ! receiver->failed;
+                pollfd requests[2] { { descriptor, POLLOUT, 0 },
+                                    { drainReceiver ? receiver->fd : -1, POLLIN, 0 } };
+                const auto result = poll (requests, drainReceiver ? 2 : 1, millisecondsLeft (deadline));
+                if (result < 0 && errno == EINTR) continue;
+                if (result <= 0) return false;
+                if (drainReceiver && (requests[1].revents & (POLLIN | POLLHUP | POLLERR)))
+                {
+                    receiver->drain();
+                    if (receiver->failed) return false;
+                }
+                if (requests[0].revents & (POLLERR | POLLHUP | POLLNVAL)) return false;
+                continue;
+            }
+            signal.broken = written < 0 && errno == EPIPE;
+            return false;
+        }
+        return true;
+    }
+
+    int fd;
+    std::vector<char> bytes;
+    bool complete = false, failed = false;
+};
+
+
 struct WaylandShmBuffer {
     wl_buffer* buffer;
     void* data = nullptr;
@@ -240,6 +377,16 @@ WaylandWindowSystem::~WaylandWindowSystem()
     initialised = false;
     keyRepeater.stopTimer();
     inputState.reset();
+    for (const auto& offer : offers)
+        WaylandSymbols::getInstance()->dataOfferDestroy (offer.first);
+    if (clipboardSource)
+        WaylandSymbols::getInstance()->dataSourceDestroy (clipboardSource);
+    if (dragSource)
+        WaylandSymbols::getInstance()->dataSourceDestroy (dragSource);
+    if (dataDevice)
+        WaylandSymbols::getInstance()->dataDeviceDestroy (dataDevice);
+    if (dataDeviceManager)
+        WaylandSymbols::getInstance()->dataDeviceManagerDestroy (dataDeviceManager);
 
     customCursors.clear();
     if (cursorTheme)
@@ -517,6 +664,7 @@ void WaylandWindowSystem::updateConstraints (WaylandWindow* window) const
 void WaylandWindowSystem::destroyWindow (WaylandWindow* window)
 {
     forgetInputSurface (window->surface);
+    if (dragTargetWindow == window) dragTargetWindow = nullptr;
     if (currentTouches)
         currentTouches->deleteAllTouchesForPeer (window->peer);
     
@@ -1479,19 +1627,19 @@ void WaylandWindowSystem::setupDataDeviceCallbacks()
         .data_offer = [] (void* data, wl_data_device*, wl_data_offer* offer)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
-            self->currentOffer = offer;
-            self->isDraggingText = false;
-            self->isDraggingFiles = false;
+            self->offers.emplace (offer, OfferTypes{});
             
             static const wl_data_offer_listener offerListener =
             {
-                .offer = [] (void*, wl_data_offer*, const char* mimeType)
+                .offer = [] (void* context, wl_data_offer* offered, const char* mimeType)
                 {
-                    auto mime = String::fromUTF8 (mimeType);
-                    if (mime == "text/uri-list")
-                        getInstance()->isDraggingFiles = true;
-                    else if (mime == "text/plain" || mime == "text/plain;charset=utf-8")
-                        getInstance()->isDraggingText = true;
+                    auto& types = static_cast<WaylandWindowSystem*> (context)->offers[offered];
+                    const auto mime = String::fromUTF8 (mimeType);
+                    if (mime == "text/uri-list") types.files = true;
+                    if (mime == "text/plain;charset=utf-8"
+                        || (mime == "UTF8_STRING" && types.text != "text/plain;charset=utf-8")
+                        || (mime == "text/plain" && types.text.isEmpty()))
+                        types.text = mime;
                 },
                     .source_actions = [] (void*, wl_data_offer*, uint32) {},
                     .action = [] (void*, wl_data_offer*, uint32) {}
@@ -1504,23 +1652,26 @@ void WaylandWindowSystem::setupDataDeviceCallbacks()
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
             self->dragTargetWindow = self->findWindowBySurface (surface);
+            auto* previous = self->currentOffer;
             self->currentOffer = offer;
-            self->currentDragInfo = ComponentPeer::DragInfo{}; // Reset
+            self->releaseOffer (previous);
+            const auto found = self->offers.find (offer);
+            const auto types = found != self->offers.end() ? found->second : OfferTypes{};
+            self->currentDragInfo = ComponentPeer::DragInfo{};
             
             if (! self->dragTargetWindow || ! self->dragTargetWindow->peer)
                 return;
             
-            // Accept the offer first so we can read data
-            if (self->isDraggingFiles)
+            if (types.files)
             {
                 WaylandSymbols::getInstance()->dataOfferAccept (offer, serial, "text/uri-list");
                 WaylandSymbols::getInstance()->dataOfferSetActions (offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
                                                                     WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE,
                                                                     WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
                 
-                // Read file data immediately
-                self->readOfferData ("text/uri-list", [self, x, y] (const String& fileList)
+                self->readOfferData (offer, "text/uri-list", [self, offer, x, y] (const String& fileList)
                 {
+                    if (self->currentOffer != offer || ! self->dragTargetWindow || ! self->dragTargetWindow->peer) return;
                     self->currentDragInfo.files.clear();
                     auto lines = StringArray::fromLines (fileList);
                     for (const auto& line : lines)
@@ -1533,15 +1684,15 @@ void WaylandWindowSystem::setupDataDeviceCallbacks()
                     self->dragTargetWindow->peer->handleDragMove (self->currentDragInfo);
                 });
             }
-            else if (self->isDraggingText)
+            else if (types.text.isNotEmpty())
             {
-                WaylandSymbols::getInstance()->dataOfferAccept (offer, serial, "text/plain");
+                WaylandSymbols::getInstance()->dataOfferAccept (offer, serial, types.text.toRawUTF8());
                 WaylandSymbols::getInstance()->dataOfferSetActions (offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
                                                                     WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
                 
-                // Read text data immediately
-                self->readOfferData ("text/plain", [self, x, y] (const String& textData)
+                self->readOfferData (offer, types.text, [self, offer, x, y] (const String& textData)
                 {
+                    if (self->currentOffer != offer || ! self->dragTargetWindow || ! self->dragTargetWindow->peer) return;
                     self->currentDragInfo.text = textData;
                     self->currentDragInfo.position = WaylandSymbols::getInstance()->fixedToPoint<int>(x, y);
                     self->dragTargetWindow->peer->handleDragMove (self->currentDragInfo);
@@ -1554,7 +1705,9 @@ void WaylandWindowSystem::setupDataDeviceCallbacks()
             if (self->dragTargetWindow && self->dragTargetWindow->peer)
                 self->dragTargetWindow->peer->handleDragExit (self->currentDragInfo);
             self->dragTargetWindow = nullptr;
+            auto* previous = self->currentOffer;
             self->currentOffer = nullptr;
+            self->releaseOffer (previous);
         },
         .motion = [] (void* data, wl_data_device*, uint32, wl_fixed_t x, wl_fixed_t y)
         {
@@ -1570,21 +1723,25 @@ void WaylandWindowSystem::setupDataDeviceCallbacks()
             if (! self->dragTargetWindow || ! self->dragTargetWindow->peer || ! self->currentOffer)
                 return;
             
-            if (self->dragTargetWindow->peer->handleDragDrop (self->currentDragInfo))
-                WaylandSymbols::getInstance()->dataOfferFinish (self->currentOffer);
+            auto* dropped = self->currentOffer;
+            if (self->dragTargetWindow->peer->handleDragDrop (self->currentDragInfo) && self->currentOffer == dropped)
+                WaylandSymbols::getInstance()->dataOfferFinish (dropped);
         },
         .selection = [] (void* data, wl_data_device*, wl_data_offer* offer)
         {
             auto* self = static_cast<WaylandWindowSystem*>(data);
-            auto callback = [] (const String& newClipboardText)
+            auto* previous = self->clipboardOffer;
+            self->clipboardOffer = offer;
+            const auto generation = ++self->clipboardGeneration;
+            self->currentClipboardText.clear();
+            self->releaseOffer (previous);
+            const auto found = self->offers.find (offer);
+            if (found == self->offers.end() || found->second.text.isEmpty()) return;
+            self->readOfferData (offer, found->second.text, [self, generation] (const String& text)
             {
-                getInstance()->currentClipboardText = newClipboardText;
-            };
-            
-            self->currentOffer = offer;
-            self->readOfferData ("UTF8_STRING", callback);
-            self->readOfferData ("text/plain", callback);
-            self->readOfferData ("text/plain;charset=utf-8", callback);
+                if (generation == self->clipboardGeneration)
+                    self->currentClipboardText = text;
+            });
         }
     };
     
@@ -2073,73 +2230,67 @@ void WaylandWindowSystem::showCursor (WaylandCursor cursorHandle)
     updateCursor();
 }
 
-void WaylandWindowSystem::readOfferData (const String& mimeType, std::function<void (const String&)> callback) const
+void WaylandWindowSystem::releaseOffer (wl_data_offer* offer)
+{
+    if (offer && offer != currentOffer && offer != clipboardOffer && offers.erase (offer) != 0)
+        WaylandSymbols::getInstance()->dataOfferDestroy (offer);
+}
+
+void WaylandWindowSystem::readOfferData (wl_data_offer* offer, const String& mimeType,
+                                       std::function<void (const String&)> callback)
 {
     int pipeFds[2];
-    if (! currentOffer || pipe (pipeFds) == -1)
-        return;
-    
-    WaylandSymbols::getInstance()->dataOfferReceive (currentOffer, mimeType.toRawUTF8(), pipeFds[1]);
+    if (! offer || pipe (pipeFds) != 0) return;
+    WaylandPipeTransfer transfer (pipeFds[0]);
+    const ScopedValueSetter<WaylandPipeTransfer*> active (activeTransfer, &transfer);
+    WaylandSymbols::getInstance()->dataOfferReceive (offer, mimeType.toRawUTF8(), pipeFds[1]);
     close (pipeFds[1]);
-    
-    WaylandSymbols::getInstance()->displayRoundtrip (display);
-    
-    // Wait for data to become available
-    fd_set fds;
-    FD_ZERO (&fds);
-    FD_SET (pipeFds[0], &fds);
-    struct timeval timeout;
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-    
-    int ret = select (pipeFds[0] + 1, &fds, nullptr, nullptr, &timeout);
-    String data;
-    if (ret > 0 && FD_ISSET (pipeFds[0], &fds))
-    {
-        char buffer[4096];
-        ssize_t bytesRead;
-        
-        // Set non-blocking
-        int flags = fcntl (pipeFds[0], F_GETFL, 0);
-        fcntl (pipeFds[0], F_SETFL, flags | O_NONBLOCK);
-        
-        while ((bytesRead = read (pipeFds[0], buffer, sizeof (buffer))) > 0)
-            data += String::createStringFromData (buffer, static_cast<int>(bytesRead));
-    }
-    
-    close (pipeFds[0]);
-    callback (data);
+    if (WaylandSymbols::getInstance()->displayRoundtrip (display) < 0 || ! transfer.receive()) return;
+    callback (transfer.bytes.empty() ? String() : String::fromUTF8 (transfer.bytes.data(), (int) transfer.bytes.size()));
 }
 
 void WaylandWindowSystem::copyTextToClipboard (const String& text)
 {
-    if (! dataDeviceManager || text.isEmpty())
-        return;
-    
+    if (! dataDeviceManager || ! dataDevice) return;
+    auto* replacement = WaylandSymbols::getInstance()->dataDeviceManagerCreateDataSource (dataDeviceManager);
+    if (! replacement) return;
+    if (clipboardSource) WaylandSymbols::getInstance()->dataSourceDestroy (clipboardSource);
+    clipboardSource = replacement;
+    publishedClipboardText = text;
     currentClipboardText = text;
-    
-    clipboardSource = WaylandSymbols::getInstance()->dataDeviceManagerCreateDataSource (dataDeviceManager);
-    
+    ++clipboardGeneration;
+
     WaylandSymbols::getInstance()->dataSourceOffer (clipboardSource, "text/plain");
     WaylandSymbols::getInstance()->dataSourceOffer (clipboardSource, "text/plain;charset=utf-8");
     WaylandSymbols::getInstance()->dataSourceOffer (clipboardSource, "UTF8_STRING");
-    
+
     static const wl_data_source_listener clipboardSourceListener = {
-            .target = [] (void*, wl_data_source*, const char*) {},
-            .send = [] (void* data, wl_data_source* source, const char*, int32 fd)
+        .target = [] (void*, wl_data_source*, const char*) {},
+        .send = [] (void* data, wl_data_source* source, const char* mime, int32 fd)
+        {
+            auto* self = static_cast<WaylandWindowSystem*> (data);
+            const auto type = String::fromUTF8 (mime);
+            if (source == self->clipboardSource
+                && (type == "text/plain" || type == "text/plain;charset=utf-8" || type == "UTF8_STRING"))
+                self->writeDataToFd (fd, self->publishedClipboardText);
+            else
+                close (fd);
+        },
+        .cancelled = [] (void* data, wl_data_source* source)
+        {
+            auto* self = static_cast<WaylandWindowSystem*> (data);
+            if (source == self->clipboardSource)
             {
-                auto* self = static_cast<WaylandWindowSystem*> (data);
-                if (source == self->clipboardSource)
-                {
-                    self->writeDataToFd (fd, self->currentClipboardText);
-                }
-            },
-            .cancelled = [] (void*, wl_data_source*) {},
-            .dnd_drop_performed = [] (void*, wl_data_source*) {},
-            .dnd_finished = [] (void*, wl_data_source*) {},
-            .action = [] (void*, wl_data_source*, uint32) {}
+                self->clipboardSource = nullptr;
+                self->publishedClipboardText.clear();
+                WaylandSymbols::getInstance()->dataSourceDestroy (source);
+            }
+        },
+        .dnd_drop_performed = [] (void*, wl_data_source*) {},
+        .dnd_finished = [] (void*, wl_data_source*) {},
+        .action = [] (void*, wl_data_source*, uint32) {}
     };
-    
+
     WaylandSymbols::getInstance()->dataSourceAddListener (clipboardSource, &clipboardSourceListener, this);
     WaylandSymbols::getInstance()->dataDeviceSetSelection (dataDevice, clipboardSource, currentMouseSerial);
 }
@@ -2184,18 +2335,20 @@ void WaylandWindowSystem::setupDragSource (WaylandWindow* window, bool isText, b
                     auto mime = String::fromUTF8 (mimeType);
                     if (mime == "text/uri-list" && ! self->dragFiles.isEmpty())
                     {
-                        // Convert file paths to URI list
                         StringArray uris;
                         for (const auto& file : self->dragFiles)
                             uris.add ("file://" + file);
 
                         self->writeDataToFd (fd, uris.joinIntoString ("\r\n") + "\r\n");
+                        return;
                     }
                     else if (mime.startsWith ("text/"))
                     {
                         self->writeDataToFd (fd, self->dragText);
+                        return;
                     }
                 }
+                close (fd);
             },
             .cancelled = [] (void* data, wl_data_source* source)
             {
@@ -2255,23 +2408,8 @@ void WaylandWindowSystem::setupDragSource (WaylandWindow* window, bool isText, b
 
 void WaylandWindowSystem::writeDataToFd (int fd, const String& data) const
 {
-    auto utf8 = data.toUTF8();
-    int64 written = 0;
-    int64 total = (int64)utf8.sizeInBytes() - 1; // Exclude null terminator
-    
-    while (written < static_cast<ssize_t> (total))
-    {
-        ssize_t result = write (fd, utf8.getAddress() + written, (uint64)(total - written));
-        if (result < 0)
-        {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                continue;
-            break;
-        }
-        written += result;
-    }
-    
-    close (fd);
+    const auto utf8 = data.toUTF8();
+    WaylandPipeTransfer::send (fd, utf8.getAddress(), utf8.sizeInBytes() - 1, activeTransfer);
 }
 
 bool WaylandWindowSystem::isKeyCurrentlyDown (int keyCode)
@@ -2310,4 +2448,5 @@ void processWaylandFd()
 
 #if JUCE_UNIT_TESTS
  #include "juce_WaylandInput_test.cpp"
+ #include "juce_WaylandClipboard_test.cpp"
 #endif
