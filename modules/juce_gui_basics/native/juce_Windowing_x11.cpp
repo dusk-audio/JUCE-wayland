@@ -865,12 +865,12 @@ void MouseInputSource::setRawMousePosition (Point<float> newPosition)
 //==============================================================================
 class MouseCursor::PlatformSpecificHandle
 {
-    union CursorHandle
+    struct CursorHandle
     {
 #if JUCE_WAYLAND
-        WaylandCursor wayland;
+        WaylandCursor wayland { 0, nullptr };
 #endif
-        Cursor x11;
+        Cursor x11 {};
     };
     
 public:
@@ -884,10 +884,7 @@ public:
     {
 #if JUCE_WAYLAND
         if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
-        {
             WaylandWindowSystem::getInstance()->deleteMouseCursor (cursorHandle.wayland);
-            return;
-        }
 #endif
         if (cursorHandle.x11 != Cursor{})
             XWindowSystem::getInstance()->deleteMouseCursor (cursorHandle.x11);
@@ -895,15 +892,17 @@ public:
 
     static void showInWindow (PlatformSpecificHandle* handle, ComponentPeer* peer)
     {
-        // Prefer the X11 path whenever a peer exists. Hybrid X11-on-
-        // Wayland apps (XWayland host for cross-toolkit plugin embedding)
-        // initialise the Wayland subsystem but route their actual peers
-        // through LinuxComponentPeer (X11). Dispatching to the Wayland
-        // path here would set the cursor on the Wayland global pointer
-        // — which is bound to a wl_surface our app never uses — so the
-        // real X11 window never gets the cursor update. Checking peer
-        // != nullptr is enough: a peer means there's a window to set
-        // the cursor on, and in our hybrid setup that window is X11.
+        // One process can hold both Wayland and X11 peers: hybrid apps
+        // initialise Wayland but route peers through LinuxComponentPeer
+        // (setSkipForPeerCreation), and native Wayland hosts still give
+        // foreign plug-in editors X11 parents. Dispatch on the peer type.
+#if JUCE_WAYLAND
+        if (dynamic_cast<WaylandComponentPeer*> (peer) != nullptr)
+        {
+            WaylandWindowSystem::getInstance()->showCursor (handle != nullptr ? handle->cursorHandle.wayland : WaylandCursor { 0, nullptr });
+            return;
+        }
+#endif
         if (peer != nullptr)
         {
             const auto cursor = handle != nullptr ? handle->cursorHandle.x11 : Cursor{};
@@ -926,10 +925,7 @@ private:
         const auto scaled = image.rescaled ((int) (image.getWidth()  / info.image.getScale()),
                                               (int) (image.getHeight() / info.image.getScale()));
         CursorHandle handle;
-        // Always build the X11 handle — hybrid X11-on-Wayland apps need
-        // it for peers routed through LinuxComponentPeer. The Wayland
-        // handle is built additionally so a pure-Wayland peer path
-        // (null peer in showInWindow's else branch) still has a cursor.
+        // Build both handles: X11 peers and Wayland peers can coexist.
         handle.x11 = XWindowSystem::getInstance()->createCustomMouseCursorInfo (scaled, info.hotspot);
 #if JUCE_WAYLAND
         if (WaylandWindowSystem::getInstance()->isWaylandAvailable())
