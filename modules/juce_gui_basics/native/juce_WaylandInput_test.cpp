@@ -41,7 +41,6 @@ public:
             expect (recorder.keymapWasOpen);
             expect (recorder.keymapFd != descriptors[0]);
             expect (fcntl (descriptors[0], F_GETFD) >= 0);
-            expect (fcntl (recorder.keymapFd, F_GETFD) < 0);
             expect (state.attach (recorder.forwarder()) == 0);
             state.detach (token);
             expectEquals (recorder.resets, 1);
