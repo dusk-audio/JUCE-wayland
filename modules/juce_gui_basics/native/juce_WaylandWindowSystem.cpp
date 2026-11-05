@@ -551,9 +551,6 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
             WaylandSymbols::getInstance()->decorFrameSetVisibility (window->handle.frame, false);
     }
     
-    if (! lastFocusedWindow)
-        lastFocusedWindow = (window->parentWindow || ! window->isVisible) ? lastFocusedWindow : window;
-    
     surfaceToWindow[window->surface] = window;
     
     toFront (window, false);
@@ -898,6 +895,8 @@ void WaylandWindowSystem::setVisible (WaylandWindow* window, bool shouldBeVisibl
     updateRegions (window);
     if (shouldBeVisible)
     {
+        if (! window->parentWindow && ! lastFocusedWindow)
+            lastFocusedWindow = window;
         if (! window->parentWindow && ! window->configureRequested && ! window->remapBarrier)
         {
             window->configureRequested = true;
