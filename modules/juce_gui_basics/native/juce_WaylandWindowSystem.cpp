@@ -746,9 +746,9 @@ void WaylandWindowSystem::startHostManagedResize (WaylandWindow* window, Resizab
     }();
     
     if (edge == LIBDECOR_RESIZE_EDGE_NONE)
-        WaylandSymbols::getInstance()->decorFrameMove (window->handle.frame, seat, currentMouseSerial);
+        WaylandSymbols::getInstance()->decorFrameMove (window->handle.frame, seat, grabSerial);
     else
-        WaylandSymbols::getInstance()->decorFrameResize (window->handle.frame, seat, currentMouseSerial, edge);
+        WaylandSymbols::getInstance()->decorFrameResize (window->handle.frame, seat, grabSerial, edge);
 }
 
 void WaylandWindowSystem::toFront (WaylandWindow* window, bool commit)
@@ -1299,6 +1299,8 @@ void WaylandWindowSystem::setupGlobalInput()
             self->currentMouseSerial = serial;
             self->currentMouseTime = time;
             const auto pressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
+            if (pressed)
+                self->grabSerial = serial;
             const auto consumed = self->inputState->button (proxy, serial, time, button, state);
             self->updateMouseModifiers (button, pressed);
             if (self->inputState->hasKeyboardFocus())
@@ -1378,6 +1380,7 @@ void WaylandWindowSystem::setupGlobalInput()
                 if (touchIndex == 0)
                 {
                     self->currentMouseSerial = serial;
+                    self->grabSerial = serial;
                     self->currentMousePosition = window->peer->localToGlobal (localPos);
                     self->lastFocusedWindow = (window->parentWindow || ! window->isVisible) ?
                                              self->lastFocusedWindow : window;
@@ -2412,7 +2415,7 @@ void WaylandWindowSystem::setupDragSource (WaylandWindow* window, bool isText, b
     }
     
     WaylandSymbols::getInstance()->dataSourceAddListener (dragSource, &dragSourceListener, this);
-    WaylandSymbols::getInstance()->dataDeviceStartDrag (dataDevice, dragSource, window->surface, nullptr, currentMouseSerial);
+    WaylandSymbols::getInstance()->dataDeviceStartDrag (dataDevice, dragSource, window->surface, nullptr, grabSerial);
 }
 
 void WaylandWindowSystem::writeDataToFd (int fd, const String& data) const

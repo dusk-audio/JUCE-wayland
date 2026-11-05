@@ -211,6 +211,7 @@ private:
     
     Point<float> currentMousePosition;
     uint32_t currentMouseSerial = 0;
+    uint32_t grabSerial = 0;
     uint32_t currentMouseTime = 0;
     
     uint32_t currentTouchTime = 0;
