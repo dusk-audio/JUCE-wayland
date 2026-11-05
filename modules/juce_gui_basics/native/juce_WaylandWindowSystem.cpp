@@ -95,13 +95,17 @@ struct WaylandWindow {
         wl_subsurface* subsurface;
     } handle;
     wl_callback* frameCallback = nullptr;
+    wl_callback* remapBarrier = nullptr;
     WaylandWindow* parentWindow = nullptr;
     WaylandComponentPeer* peer;
     std::unique_ptr<WaylandShmBuffer> currentBuffer = nullptr;
     std::set<wl_output*> displays;
     Rectangle<int> bounds;
     uint16 bufferScale = 1;
-    bool isVisible:1 = true;
+    bool isVisible:1 = false;
+    bool configureRequested = false;
+    bool configured = false;
+    bool contentMapped = false;
     bool isFullscreen:1 = false;
     bool isMinimised:1 = false;
     bool isActivated:1 = false;
@@ -293,9 +297,6 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
     
     updateRegions (window);
     
-    static bool isConfigured;
-    isConfigured = false;
-
     if (isSubsurface)
     {
         window->handle.subsurface = WaylandSymbols::getInstance()->subcompositorGetSubsurface (subcompositor, window->surface, window->parentWindow->surface);
@@ -306,7 +307,7 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
         WaylandSymbols::getInstance()->surfaceSetBufferScale (window->surface, window->bufferScale);
         
         WaylandSymbols::getInstance()->surfaceCommit (window->surface);
-        WaylandSymbols::getInstance()->surfaceCommit (window->parentWindow->surface);
+        commitEmbeddedChildren (window->parentWindow->surface);
     }
     else
     {
@@ -327,6 +328,8 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
             .configure = [] (libdecor_frame* frame, libdecor_configuration* configuration, void* data)
             {
                 auto* w = static_cast<WaylandWindow*> (data);
+                if (! w->configureRequested)
+                    return;
                 if (! ComponentPeer::isValidPeer (w->peer))
                 {
                     auto* state = WaylandSymbols::getInstance()->decorStateNew (1, 1);
@@ -334,7 +337,9 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
                     if (state) WaylandSymbols::getInstance()->decorStateFree (state);
                     return;
                 }
-                bool wasActivated = w->isActivated;
+                const bool wasActivated = w->isActivated;
+                auto* const configuredPeer = w->peer;
+                auto* const configuredSurface = w->surface;
                     
                 int windowState;
                 if (WaylandSymbols::getInstance()->decorConfigurationGetWindowState (configuration, &windowState))
@@ -345,38 +350,33 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
                 }
                 
                 WaylandComponentPeer::isActiveApplication = false;
-                for(auto& [surface, window] : WaylandWindowSystem::getInstance()->surfaceToWindow)
+                for (const auto& entry : WaylandWindowSystem::getInstance()->surfaceToWindow)
                 {
-                    if(window->isActivated)
+                    if (entry.second->isActivated)
                     {
                         WaylandComponentPeer::isActiveApplication = true;
                         break;
                     }
                 }
                 
-                if (! wasActivated && w->isActivated)
-                {
-                    w->peer->handleBroughtToFront();
-                }
-                
-                int width = std::max (1, (int)(w->peer->getComponent().getWidth()));
-                int height = std::max (1, (int)(w->peer->getComponent().getHeight()));
-                if (WaylandSymbols::getInstance()->decorConfigurationGetContentSize (configuration, frame, &width, &height))
-                {
-                    if (width > 0 && height > 0)
-                    {
-                        w->bounds.setSize (width, height);
-                        w->peer->setBounds (Rectangle<int>(0, 0, width, height), w->isFullscreen);
-                        w->peer->repaint (Rectangle<int>(0, 0, width, height));
-                    }
-                }
-                
+                int width = std::max (1, w->bounds.getWidth());
+                int height = std::max (1, w->bounds.getHeight());
+                WaylandSymbols::getInstance()->decorConfigurationGetContentSize (configuration, frame, &width, &height);
+                width = std::max (1, width);
+                height = std::max (1, height);
                 auto* state = WaylandSymbols::getInstance()->decorStateNew (width, height);
                 WaylandSymbols::getInstance()->decorFrameCommit (frame, state, configuration);
                 WaylandSymbols::getInstance()->decorStateFree (state);
+                w->configured = true;
 
+                // Resizing or focus callbacks may destroy the peer or submit a frame.
+                configuredPeer->setBounds (Rectangle<int> (0, 0, width, height), w->isFullscreen);
+                if (getInstance()->findWindowBySurface (configuredSurface) != w || ! ComponentPeer::isValidPeer (configuredPeer))
+                    return;
                 getInstance()->updateRegions (w);
-                isConfigured = true;
+                configuredPeer->repaint (Rectangle<int> (0, 0, width, height));
+                if (! wasActivated && w->isActivated)
+                    configuredPeer->handleBroughtToFront();
             },
                 .close = [] (libdecor_frame*, void* user_data){
                     auto* w = static_cast<WaylandWindow*> (user_data);
@@ -390,7 +390,6 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
         
         
         window->handle.frame = WaylandSymbols::getInstance()->decorDecorate (decorator, window->surface, &frame_interface, window);
-        WaylandSymbols::getInstance()->decorFrameSetCapabilities (window->handle.frame, (libdecor_capabilities)capabilities);
         
         if (! window->handle.frame)
         {
@@ -399,21 +398,8 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
             return nullptr;
         }
         
-        WaylandSymbols::getInstance()->decorFrameMap (window->handle.frame);
-        WaylandSymbols::getInstance()->surfaceCommit (window->surface);
-        
-        // Wait for initial configure
-        int timeout = 50;
-        while (! isConfigured && timeout-- > 0)
-        {
-            WaylandSymbols::getInstance()->displayDispatchPending (display);
-            if (! isConfigured)
-            {
-                usleep (10000);
-                WaylandSymbols::getInstance()->displayDispatch (display);
-            }
-        }
-        
+        WaylandSymbols::getInstance()->decorFrameSetCapabilities (window->handle.frame, (libdecor_capabilities)capabilities);
+
         if (! (styleFlags & ComponentPeer::windowHasTitleBar))
             WaylandSymbols::getInstance()->decorFrameSetVisibility (window->handle.frame, false);
     }
@@ -446,7 +432,8 @@ int WaylandWindowSystem::getScaleFactorForWindow (WaylandWindow* window)
 
 void WaylandWindowSystem::requestFrame (WaylandWindow* window)
 {
-    if (! window || ! window->surface || window->frameCallback)
+    if (! window || ! window->surface || window->frameCallback
+        || ! window->isVisible || (! window->parentWindow && ! window->configured))
         return;
     
     static const wl_callback_listener frameListener = {
@@ -524,8 +511,7 @@ void WaylandWindowSystem::updateConstraints (WaylandWindow* window) const
         WaylandSymbols::getInstance()->decorFrameSetMaxContentSize (window->handle.frame, 0, 0);
     }
     
-    // Commit the frame to apply changes immediately
-    WaylandSymbols::getInstance()->decorFrameCommit (window->handle.frame, nullptr, nullptr);
+    window->peer->repaint (window->bounds.withZeroOrigin());
 }
 
 void WaylandWindowSystem::destroyWindow (WaylandWindow* window)
@@ -540,7 +526,9 @@ void WaylandWindowSystem::destroyWindow (WaylandWindow* window)
     
     if (window->frameCallback)
         WaylandSymbols::getInstance()->callbackDestroy (window->frameCallback);
-    
+    if (window->remapBarrier)
+        WaylandSymbols::getInstance()->callbackDestroy (window->remapBarrier);
+
     if (window->parentWindow)
         WaylandSymbols::getInstance()->subsurfaceDestroy (window->handle.subsurface);
     else
@@ -574,13 +562,12 @@ void WaylandWindowSystem::setBounds (WaylandWindow* window, Rectangle<int> b)
         window->bounds = b;
         WaylandSymbols::getInstance()->subsurfaceSetPosition (window->handle.subsurface, window->bounds.getX(), window->bounds.getY());
         WaylandSymbols::getInstance()->surfaceCommit (window->surface);
-        WaylandSymbols::getInstance()->surfaceCommit (window->parentWindow->surface);
+        commitEmbeddedChildren (window->parentWindow->surface);
     }
     else
     {
         window->bounds = b.withZeroOrigin();
-        auto* state = WaylandSymbols::getInstance()->decorStateNew (b.getWidth(), b.getHeight());
-        WaylandSymbols::getInstance()->decorFrameCommit (window->handle.frame, state, nullptr);
+        window->peer->repaint (window->bounds);
     }
 }
 
@@ -750,7 +737,7 @@ void WaylandWindowSystem::enforceOrder()
         for (auto* s : subsurfacesBelow)
             WaylandSymbols::getInstance()->surfaceCommit (s->surface);
 
-        WaylandSymbols::getInstance()->surfaceCommit (parent->surface);
+        commitEmbeddedChildren (parent->surface);
 
         for (auto* s : subsurfacesAbove)
             WaylandSymbols::getInstance()->surfaceCommit (s->surface);
@@ -760,29 +747,50 @@ void WaylandWindowSystem::enforceOrder()
 void WaylandWindowSystem::setVisible (WaylandWindow* window, bool shouldBeVisible)
 {
     window->isVisible = shouldBeVisible;
+    updateRegions (window);
     if (shouldBeVisible)
     {
-        if (window->currentBuffer)
+        if (! window->parentWindow && ! window->configureRequested && ! window->remapBarrier)
         {
-            WaylandSymbols::getInstance()->surfaceAttach (window->surface, window->currentBuffer->buffer, 0, 0);
-            WaylandSymbols::getInstance()->surfaceCommit (window->surface);
+            window->configureRequested = true;
+            WaylandSymbols::getInstance()->decorFrameMap (window->handle.frame);
         }
-        requestFrame (window);
-        if (window->parentWindow)
-        {
-            WaylandSymbols::getInstance()->surfaceCommit (window->parentWindow->surface);
-        }
+        window->peer->repaint (window->bounds.withZeroOrigin());
+        return;
     }
-    else
+
+    if (window->frameCallback)
     {
-        WaylandSymbols::getInstance()->surfaceAttach (window->surface, nullptr, 0, 0);
-        WaylandSymbols::getInstance()->surfaceCommit (window->surface);
-        if (window->parentWindow)
-        {
-            WaylandSymbols::getInstance()->surfaceCommit (window->parentWindow->surface);
-        }
+        WaylandSymbols::getInstance()->callbackDestroy (window->frameCallback);
+        window->frameCallback = nullptr;
     }
-    updateRegions (window);
+    if (! window->contentMapped)
+        return;
+
+    WaylandSymbols::getInstance()->surfaceAttach (window->surface, nullptr, 0, 0);
+    WaylandSymbols::getInstance()->surfaceCommit (window->surface);
+    window->contentMapped = false;
+    if (window->parentWindow)
+    {
+        commitEmbeddedChildren (window->parentWindow->surface);
+        return;
+    }
+
+    window->configured = false;
+    window->configureRequested = false;
+    // Drain old configure events before requesting the next mapping generation.
+    static const wl_callback_listener listener {
+        [] (void* data, wl_callback* callback, uint32)
+        {
+            auto* w = static_cast<WaylandWindow*> (data);
+            WaylandSymbols::getInstance()->callbackDestroy (callback);
+            w->remapBarrier = nullptr;
+            if (w->isVisible)
+                getInstance()->setVisible (w, true);
+        }
+    };
+    window->remapBarrier = WaylandSymbols::getInstance()->displaySync (display);
+    WaylandSymbols::getInstance()->callbackAddListener (window->remapBarrier, &listener, window);
 }
 
 void WaylandWindowSystem::setFullscreen (WaylandWindow* window, bool shouldBeFullscreen)
@@ -833,7 +841,8 @@ void WaylandWindowSystem::blitToWindow (WaylandWindow* window, const Image& imag
     int windowWidth = window->bounds.getWidth() * bufferScale;
     int windowHeight = window->bounds.getHeight() * bufferScale;
         
-    if (windowWidth <= 0 || windowHeight <= 0 || ! window->isVisible)
+    if (windowWidth <= 0 || windowHeight <= 0 || ! window->isVisible
+        || (! window->parentWindow && ! window->configured))
         return;
     
     auto& currentBuffer = window->currentBuffer;
@@ -842,7 +851,6 @@ void WaylandWindowSystem::blitToWindow (WaylandWindow* window, const Image& imag
         try
         {
             currentBuffer = std::make_unique<WaylandShmBuffer> (windowWidth, windowHeight);
-            WaylandSymbols::getInstance()->surfaceAttach (window->surface, currentBuffer->buffer, 0, 0);
         }
         catch (...)
         {
@@ -1800,17 +1808,38 @@ void WaylandWindowSystem::handleKeyRepeat()
 
 void WaylandWindowSystem::commit (WaylandWindow* window)
 {
-    if (window->currentBuffer)
-        WaylandSymbols::getInstance()->surfaceAttach (window->surface, window->currentBuffer->buffer, 0, 0);
-    
-    WaylandSymbols::getInstance()->surfaceCommit (window->surface);
-    
-    // Request the next frame callback after committing
+    if (! window->isVisible || (! window->parentWindow && ! window->configured)
+        || ! window->currentBuffer
+        || window->currentBuffer->width != window->bounds.getWidth() * window->bufferScale
+        || window->currentBuffer->height != window->bounds.getHeight() * window->bufferScale)
+        return;
+
+    if (! window->parentWindow)
+    {
+        auto* state = WaylandSymbols::getInstance()->decorStateNew (window->bounds.getWidth(), window->bounds.getHeight());
+        WaylandSymbols::getInstance()->decorFrameCommit (window->handle.frame, state, nullptr);
+        WaylandSymbols::getInstance()->decorStateFree (state);
+    }
+    updateRegions (window);
+    WaylandSymbols::getInstance()->surfaceAttach (window->surface, window->currentBuffer->buffer, 0, 0);
     requestFrame (window);
-    
-    // Commit parent surface if this is a subsurface
+    WaylandSymbols::getInstance()->surfaceCommit (window->surface);
+    window->contentMapped = true;
     if (window->parentWindow)
-        WaylandSymbols::getInstance()->surfaceCommit (window->parentWindow->surface);
+        commitEmbeddedChildren (window->parentWindow->surface);
+}
+
+bool WaylandWindowSystem::commitEmbeddedChildren (wl_surface* surface)
+{
+    auto* window = findWindowBySurface (surface);
+    if (! window)
+        return false;
+    if (window->isVisible && (window->parentWindow || window->configured) && window->contentMapped
+        && window->currentBuffer
+        && window->currentBuffer->width == window->bounds.getWidth() * window->bufferScale
+        && window->currentBuffer->height == window->bounds.getHeight() * window->bufferScale)
+        WaylandSymbols::getInstance()->surfaceCommit (surface);
+    return true;
 }
 
 // Add this method to get display information

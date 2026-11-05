@@ -107,6 +107,8 @@ public:
     
     wl_surface* getSurfaceForWindow (WaylandWindow* window);
     void commit (WaylandWindow* window);
+    // Latch child changes now, or on the next configured content frame. False for unknown surfaces.
+    bool commitEmbeddedChildren (wl_surface*);
     void requestFrame (WaylandWindow* window);
     
     // Cursor interface

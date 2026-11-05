@@ -227,6 +227,10 @@ public:
                                          (wl_display*),
                                          wl_registry*)
 
+    JUCE_DECLARE_INLINE_FUNCTION (wl_display_sync, displaySync,
+                                         (wl_display*),
+                                         wl_callback*)
+
     // wl_registry
     JUCE_DECLARE_INLINE_FUNCTION (wl_registry_add_listener, registryAddListener,
                                          (wl_registry*, const wl_registry_listener*, void*),

@@ -48,6 +48,7 @@ bool WaylandSymbols::loadAllSymbols()
     using namespace WaylandSymbolHelpers;
     
     JUCE_DEFINE_INLINE_FUNCTION (wl_display_get_registry, displayGetRegistry)
+    JUCE_DEFINE_INLINE_FUNCTION (wl_display_sync, displaySync)
     JUCE_DEFINE_INLINE_FUNCTION (wl_registry_add_listener, registryAddListener)
     JUCE_DEFINE_INLINE_FUNCTION (wl_registry_bind, registryBind)
     JUCE_DEFINE_INLINE_FUNCTION (wl_registry_destroy, registryDestroy)
