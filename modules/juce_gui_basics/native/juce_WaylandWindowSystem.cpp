@@ -1986,6 +1986,12 @@ void WaylandWindowSystem::commit (WaylandWindow* window)
         commitEmbeddedChildren (window->parentWindow->surface);
 }
 
+bool WaylandWindowSystem::isSurfaceMapped (wl_surface* surface) const
+{
+    const auto found = surfaceToWindow.find (surface);
+    return found != surfaceToWindow.end() && found->second->isVisible && found->second->contentMapped;
+}
+
 bool WaylandWindowSystem::commitEmbeddedChildren (wl_surface* surface)
 {
     auto* window = findWindowBySurface (surface);
