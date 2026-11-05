@@ -131,7 +131,6 @@ private:
     
     // Z-order management
     void enforceOrder();
-    std::vector<WaylandWindow*> getSubsurfacesForParent (WaylandWindow* parent) const;
     auto findInZOrder (WaylandWindow* window) { return std::find (zOrder.begin(), zOrder.end(), window); }
     
     // Input event handling
