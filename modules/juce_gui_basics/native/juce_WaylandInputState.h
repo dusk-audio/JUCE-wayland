@@ -15,6 +15,9 @@ struct WaylandInputState
 
     ~WaylandInputState()
     {
+        jassert (callbackDepth == 0 && ! updatingDevices);
+        detach (registration);
+        finishReset();
         if (keymapFd >= 0)
             close (keymapFd);
     }

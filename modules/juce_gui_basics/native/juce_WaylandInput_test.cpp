@@ -118,6 +118,86 @@ public:
             expect (state.key (nullptr, 3, 4, 30, WL_KEYBOARD_KEY_STATE_RELEASED));
         }
 
+        beginTest ("Owned targets survive nested detach, consumed queries and final reset");
+        for (const auto nested : { false, true })
+        {
+            WaylandInputState state;
+            std::vector<int> order;
+            auto owner = std::make_shared<Recorder>();
+            const std::weak_ptr<Recorder> weak = owner;
+            auto* raw = owner.get();
+            owner->consume = true;
+            owner->onConsumed = [&] { expect (! weak.expired()); order.push_back (2); };
+            owner->onReset = [&] { expect (! weak.expired()); order.push_back (3); };
+            owner->onDestroy = [&] { order.push_back (4); };
+            const auto token = [&] {
+                auto target = owner->forwarder();
+                target.lifetime = owner;
+                return state.attach (target);
+            }();
+            expect (token != 0);
+            owner->onKey = [&] {
+                if (nested && raw->keyEvents == 1)
+                    expect (state.key (nullptr, 2, 3, 31, WL_KEYBOARD_KEY_STATE_PRESSED));
+                else
+                {
+                    expect (state.detach (token));
+                    owner.reset();
+                }
+                expect (! weak.expired());
+                order.push_back (1);
+            };
+            expect (state.key (nullptr, 1, 2, 30, WL_KEYBOARD_KEY_STATE_PRESSED));
+            expect (weak.expired());
+            expect (order == (nested ? std::vector<int> { 1, 2, 1, 2, 3, 4 }
+                                    : std::vector<int> { 1, 2, 3, 4 }));
+            expect (state.key (nullptr, 3, 4, 30, WL_KEYBOARD_KEY_STATE_RELEASED));
+        }
+
+        beginTest ("Device removal retains a target detached inside its reset");
+        {
+            WaylandInputState state;
+            std::vector<int> order;
+            auto owner = std::make_shared<Recorder>();
+            const std::weak_ptr<Recorder> weak = owner;
+            owner->onDestroy = [&] { order.push_back (2); };
+            const auto token = [&] {
+                auto target = owner->forwarder();
+                target.lifetime = owner;
+                return state.attach (target);
+            }();
+            owner->onReset = [&] {
+                expect (state.detach (token));
+                owner.reset();
+                expect (! weak.expired());
+                order.push_back (1);
+            };
+            expect (state.replaceDevices (true, true, [&] {
+                expect (weak.expired());
+                order.push_back (3);
+            }));
+            expect (order == std::vector<int> ({ 1, 2, 3 }));
+            expect (! state.detach (token));
+        }
+
+        beginTest ("Final state destruction resets before releasing the retained target");
+        {
+            std::vector<int> order;
+            std::weak_ptr<Recorder> weak;
+            {
+                WaylandInputState state;
+                auto owner = std::make_shared<Recorder>();
+                weak = owner;
+                owner->onReset = [&] { expect (! weak.expired()); order.push_back (1); };
+                owner->onDestroy = [&] { order.push_back (2); };
+                auto target = owner->forwarder();
+                target.lifetime = owner;
+                expect (state.attach (target) != 0);
+            }
+            expect (weak.expired());
+            expect (order == std::vector<int> ({ 1, 2 }));
+        }
+
         beginTest ("Destroyed foreign surfaces are not replayed and host focus survives");
         {
             WaylandInputState state;
@@ -299,7 +379,13 @@ private:
         int keymapFd = -1, resets = 0, keyEvents = 0;
         wl_fixed_t x = 0, y = 0;
         bool keymapWasOpen = false, consume = false, focused = false;
-        std::function<void()> onKey, onReset;
+        std::function<void()> onKey, onReset, onConsumed, onDestroy;
+
+        ~Recorder()
+        {
+            if (onDestroy)
+                onDestroy();
+        }
 
         WaylandWindowSystem::InputForwarder forwarder()
         {
@@ -346,7 +432,12 @@ private:
                 [] (void*, wl_pointer*, uint32, uint32, uint32, uint32) {}
             };
             return { &keyboard, &pointer, this,
-                [] (void* data) { return static_cast<Recorder*> (data)->consume; },
+                [] (void* data) {
+                    auto& r = *static_cast<Recorder*> (data);
+                    if (r.onConsumed)
+                        r.onConsumed();
+                    return r.consume;
+                },
                 [] (void* data) { return static_cast<Recorder*> (data)->focused; },
                 [] (void* data) { static_cast<Recorder*> (data)->focused = false; },
                 [] (void* data) {

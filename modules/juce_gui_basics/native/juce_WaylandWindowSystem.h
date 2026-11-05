@@ -39,9 +39,11 @@ public:
         bool (*hasKeyboardFocus) (void*) = nullptr;
         void (*releaseFocus) (void*) = nullptr;
         void (*reset) (void*) = nullptr;
+        std::shared_ptr<void> lifetime {};
     };
 
-    // Message-thread only. The target must survive each callback, including reset.
+    // Message-thread only. Optional lifetime ownership survives callbacks and final reset.
+    // Without it, the caller must keep the target alive through reset.
     // Listeners receive a duplicate keymap FD and must close it. Do not install
     // these listeners on the host's proxies. Detach before destroying the target.
     // consumed is queried only after key/button. Attach replays current input and

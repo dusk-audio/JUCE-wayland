@@ -233,6 +233,10 @@ WaylandWindowSystem::WaylandWindowSystem()
 
 WaylandWindowSystem::~WaylandWindowSystem()
 {
+    initialised = false;
+    keyRepeater.stopTimer();
+    inputState.reset();
+
     customCursors.clear();
     if (cursorTheme)
         WaylandSymbols::getInstance()->cursorThemeDestroy (cursorTheme);
@@ -967,13 +971,14 @@ uint64 WaylandWindowSystem::attachInputForwarder (const InputForwarder& forwarde
 
 void WaylandWindowSystem::detachInputForwarder (uint64 registration)
 {
-    if (inputState->detach (registration))
+    if (inputState && inputState->detach (registration))
         inputState->forgetForeignSurfaces ([this] (wl_surface* surface) { return findWindowBySurface (surface) != nullptr; });
 }
 
 void WaylandWindowSystem::forgetInputSurface (wl_surface* surface)
 {
-    inputState->forgetSurface (surface);
+    if (inputState)
+        inputState->forgetSurface (surface);
 }
 
 void WaylandWindowSystem::setupGlobalInput()
