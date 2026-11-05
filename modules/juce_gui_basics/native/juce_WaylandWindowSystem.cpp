@@ -165,7 +165,7 @@ WaylandWindowSystem::WaylandWindowSystem()
             {
                 self->shm = static_cast<wl_shm*>(WaylandSymbols::getInstance()->registryBind (r, name, WaylandSymbols::getInstance()->shmInterface, std::min (version, 1u)));
             }
-            else if (interface =="wl_seat")
+            else if (interface == "wl_seat" && ! self->seat)
             {
                 self->seat = static_cast<wl_seat*>(WaylandSymbols::getInstance()->registryBind (r, name, WaylandSymbols::getInstance()->seatInterface, std::min (version, 7u)));
                 
@@ -527,7 +527,7 @@ void WaylandWindowSystem::updateConstraints (WaylandWindow* window) const
 void WaylandWindowSystem::destroyWindow (WaylandWindow* window)
 {
     forgetInputSurface (window->surface);
-    if (hasTouch)
+    if (currentTouches)
         currentTouches->deleteAllTouchesForPeer (window->peer);
     
     auto it = findInZOrder (window);
@@ -1286,24 +1286,90 @@ void WaylandWindowSystem::setupGlobalInput()
          .orientation = [] (void*, wl_touch*, int32, wl_fixed_t) {}
     };
        
-    if (hasTouch)
-    {
-       currentTouches = std::make_unique<MultiTouchMapper<int32>>();
-       globalTouch = WaylandSymbols::getInstance()->seatGetTouch (seat);
-       WaylandSymbols::getInstance()->touchAddListener (globalTouch, &touchListener, this);
-    }
-    
-    if (hasMouse)
-    {
-      globalPointer = WaylandSymbols::getInstance()->seatGetPointer (seat);
-      WaylandSymbols::getInstance()->pointerAddListener (globalPointer, &pointerListener, this);
-    }
-    
-    if (hasKeyboard)
-    {
-      globalKeyboard = WaylandSymbols::getInstance()->seatGetKeyboard (seat);
-      WaylandSymbols::getInstance()->keyboardAddListener (globalKeyboard, &keyboardListener, this);
-    }
+    const auto wantTouch = hasTouch;
+    const auto wantMouse = hasMouse;
+    const auto wantKeyboard = hasKeyboard;
+    const auto update = [this, wantTouch, wantMouse, wantKeyboard] {
+        auto* symbols = WaylandSymbols::getInstance();
+        WaylandInputState::updateProxy (globalTouch, wantTouch, [&] {
+            auto* proxy = symbols->seatGetTouch (seat);
+            if (proxy)
+            {
+                currentTouches = std::make_unique<MultiTouchMapper<int32>>();
+                symbols->touchAddListener (proxy, &touchListener, this);
+            }
+            return proxy;
+        }, [&] (wl_touch* proxy) {
+            std::vector<ComponentPeer*> peers;
+            for (const auto& entry : surfaceToWindow)
+                peers.push_back (entry.second->peer);
+            for (auto* peer : peers)
+            {
+                const auto indices = currentTouches->getAllTouchIndicesForPeer (peer);
+                for (auto index : indices)
+                    if (ComponentPeer::isValidPeer (peer))
+                        if (auto* window = getWaylandWindowForPeer (peer))
+                            handleTouchEvent (window, peer->globalToLocal (currentMousePosition), index, MouseEventFlags::upAndCancel);
+            }
+            currentTouches.reset();
+            if (symbols->proxyGetVersion (reinterpret_cast<wl_proxy*> (proxy)) >= WL_TOUCH_RELEASE_SINCE_VERSION)
+                symbols->touchRelease (proxy);
+            else
+                symbols->touchDestroy (proxy);
+        });
+
+        WaylandInputState::updateProxy (globalPointer, wantMouse, [&] {
+            auto* proxy = symbols->seatGetPointer (seat);
+            if (proxy)
+                symbols->pointerAddListener (proxy, &pointerListener, this);
+            return proxy;
+        }, [&] (wl_pointer* proxy) {
+            auto* window = std::exchange (pointerFocused, nullptr);
+            ModifierKeys::currentModifiers = ModifierKeys::currentModifiers.withoutMouseButtons();
+            currentMousePosition = MouseInputSource::offscreenMousePos;
+            if (window)
+                handleMouseEvent (window);
+            if (symbols->proxyGetVersion (reinterpret_cast<wl_proxy*> (proxy)) >= WL_POINTER_RELEASE_SINCE_VERSION)
+                symbols->pointerRelease (proxy);
+            else
+                symbols->pointerDestroy (proxy);
+        });
+
+        WaylandInputState::updateProxy (globalKeyboard, wantKeyboard, [&] {
+            auto* proxy = symbols->seatGetKeyboard (seat);
+            if (proxy)
+                symbols->keyboardAddListener (proxy, &keyboardListener, this);
+            return proxy;
+        }, [&] (wl_keyboard* proxy) {
+            auto* window = std::exchange (keyboardFocused, nullptr);
+            keyRepeater.stopTimer();
+            keysCurrentlyDown.clear();
+            if (xkbState)
+                symbols->xkbStateUnref (std::exchange (xkbState, nullptr));
+            if (keymap)
+                symbols->xkbKeymapUnref (std::exchange (keymap, nullptr));
+            ModifierKeys::currentModifiers = ModifierKeys::currentModifiers.withOnlyMouseButtons();
+            if (window)
+            {
+                auto* peer = window->peer;
+                peer->handleKeyUpOrDown (false);
+                if (ComponentPeer::isValidPeer (peer))
+                    peer->handleFocusLoss();
+            }
+            if (symbols->proxyGetVersion (reinterpret_cast<wl_proxy*> (proxy)) >= WL_KEYBOARD_RELEASE_SINCE_VERSION)
+                symbols->keyboardRelease (proxy);
+            else
+                symbols->keyboardDestroy (proxy);
+        });
+    };
+
+    const auto removeKeyboard = globalKeyboard && ! wantKeyboard;
+    const auto removePointer = globalPointer && ! wantMouse;
+    if (! inputState->replaceDevices (removeKeyboard, removePointer, update))
+        MessageManager::callAsync ([this] {
+            if (getInstanceWithoutCreating() == this)
+                setupGlobalInput();
+        });
 }
 
 void WaylandWindowSystem::setupDisplay (wl_output* output)

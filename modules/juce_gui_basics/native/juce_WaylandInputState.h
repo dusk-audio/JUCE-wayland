@@ -21,7 +21,7 @@ struct WaylandInputState
 
     uint64 attach (const Forwarder& next)
     {
-        if (registration != 0 || callbackDepth != 0 || ! next.keyboard || ! next.pointer
+        if (registration != 0 || callbackDepth != 0 || updatingDevices || ! next.keyboard || ! next.pointer
             || ! next.consumed || ! next.hasKeyboardFocus || ! next.releaseFocus || ! next.reset)
             return 0;
 
@@ -42,10 +42,68 @@ struct WaylandInputState
         if (token == 0 || token != registration)
             return false;
 
-        pendingReset = forwarder;
+        if (! suspended)
+            pendingReset = forwarder;
         forwarder = {};
         registration = 0;
         finishReset();
+        return true;
+    }
+
+    template <typename Proxy, typename Create, typename Destroy>
+    static void updateProxy (Proxy*& proxy, bool available, Create create, Destroy destroy)
+    {
+        if (available && ! proxy)
+            proxy = create();
+        else if (! available && proxy)
+            destroy (std::exchange (proxy, nullptr));
+    }
+
+    template <typename Replace>
+    bool replaceDevices (bool removeKeyboard, bool removePointer, Replace replace)
+    {
+        if (callbackDepth != 0 || updatingDevices)
+            return false;
+
+        updatingDevices = true;
+        const ScopeGuard complete { [this] { updatingDevices = false; suspended = false; } };
+        suspended = removeKeyboard || removePointer;
+        if (suspended && registration != 0)
+        {
+            const auto target = forwarder;
+            ++callbackDepth;
+            const ScopeGuard resetComplete { [this] { --callbackDepth; } };
+            target.reset (target.data);
+        }
+        if (removeKeyboard)
+        {
+            if (keymapFd >= 0)
+                close (keymapFd);
+            keymapFd = -1;
+            keyboard = nullptr;
+            keyboardSurface = nullptr;
+            heldKeys.clear();
+            consumedKeys.clear();
+            haveModifiers = false;
+            haveRepeat = false;
+        }
+        if (removePointer)
+        {
+            pointer = nullptr;
+            pointerSurface = nullptr;
+            consumedButtons.clear();
+        }
+        replace();
+        suspended = false;
+
+        if ((removeKeyboard || removePointer) && registration != 0)
+        {
+            const auto fd = keymapFd < 0 ? -1 : fcntl (keymapFd, F_DUPFD_CLOEXEC, 0);
+            if (keymapFd >= 0 && fd < 0)
+                detach (registration);
+            else
+                replay (fd);
+        }
         return true;
     }
 
@@ -89,7 +147,7 @@ struct WaylandInputState
         keymapFd = fd;
         keymapFormat = format;
         keymapSize = size;
-        if (registration == 0)
+        if (registration == 0 || suspended)
             return;
 
         const auto copy = fcntl (fd, F_DUPFD_CLOEXEC, 0);
@@ -259,7 +317,7 @@ private:
     template <typename Callback>
     void withForwarder (Callback callback)
     {
-        if (registration == 0)
+        if (registration == 0 || suspended)
             return;
         const auto target = forwarder;
         ++callbackDepth;
@@ -314,6 +372,7 @@ private:
     Forwarder forwarder, pendingReset;
     uint64 generation = 0, registration = 0;
     int callbackDepth = 0;
+    bool suspended = false, updatingDevices = false;
     int keymapFd = -1;
     uint32 keymapFormat = 0, keymapSize = 0;
     wl_keyboard* keyboard = nullptr;

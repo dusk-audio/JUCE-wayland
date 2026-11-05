@@ -348,6 +348,8 @@ public:
                                          (wl_keyboard*),
                                          void)
     JUCE_DECLARE_INLINE_FUNCTION(wl_touch_add_listener, touchAddListener, (wl_touch*, const wl_touch_listener*, void*), int)
+    JUCE_DECLARE_INLINE_FUNCTION (wl_touch_release, touchRelease, (wl_touch*), void)
+    JUCE_DECLARE_INLINE_FUNCTION (wl_touch_destroy, touchDestroy, (wl_touch*), void)
 
     // wl_data_device_manager
     JUCE_DECLARE_INLINE_FUNCTION (wl_data_device_manager_create_data_source, dataDeviceManagerCreateDataSource,

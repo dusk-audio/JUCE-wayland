@@ -81,7 +81,9 @@ bool WaylandSymbols::loadAllSymbols()
     JUCE_DEFINE_INLINE_FUNCTION (wl_pointer_release, pointerRelease)
     JUCE_DEFINE_INLINE_FUNCTION (wl_pointer_destroy, pointerDestroy)
     JUCE_DEFINE_INLINE_FUNCTION (wl_keyboard_add_listener, keyboardAddListener)
-    JUCE_DEFINE_INLINE_FUNCTION (wl_touch_add_listener, touchAddListener);  
+    JUCE_DEFINE_INLINE_FUNCTION (wl_touch_add_listener, touchAddListener)
+    JUCE_DEFINE_INLINE_FUNCTION (wl_touch_release, touchRelease)
+    JUCE_DEFINE_INLINE_FUNCTION (wl_touch_destroy, touchDestroy)
   	
     JUCE_DEFINE_INLINE_FUNCTION (wl_keyboard_release, keyboardRelease)
     JUCE_DEFINE_INLINE_FUNCTION (wl_keyboard_destroy, keyboardDestroy)

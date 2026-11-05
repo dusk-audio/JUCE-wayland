@@ -158,6 +158,118 @@ public:
             state.detach (token);
         }
 
+        beginTest ("Repeated capabilities retain exactly one proxy until removal");
+        {
+            wl_keyboard* proxy = nullptr;
+            int creates = 0, destroys = 0, storage = 0;
+            const auto create = [&] { ++creates; return reinterpret_cast<wl_keyboard*> (&storage); };
+            const auto destroy = [&] (wl_keyboard* old) {
+                expect (proxy == nullptr);
+                expect (old == reinterpret_cast<wl_keyboard*> (&storage));
+                ++destroys;
+            };
+            for (int cycle = 0; cycle < 3; ++cycle)
+            {
+                for (int repeat = 0; repeat < 4; ++repeat)
+                    WaylandInputState::updateProxy (proxy, true, create, destroy);
+                expectEquals (creates, cycle + 1);
+                expect (proxy != nullptr);
+                for (int repeat = 0; repeat < 4; ++repeat)
+                    WaylandInputState::updateProxy (proxy, false, create, destroy);
+                expectEquals (destroys, cycle + 1);
+            }
+        }
+
+        beginTest ("Unchanged capabilities preserve focus and serialize nested device updates");
+        {
+            WaylandInputState state;
+            Recorder recorder;
+            const auto token = state.attach (recorder.forwarder());
+            recorder.focused = true;
+            expect (state.replaceDevices (false, false, [&] {
+                expect (! state.replaceDevices (false, false, [] {}));
+                expect (state.hasKeyboardFocus());
+                state.key (nullptr, 1, 2, 30, WL_KEYBOARD_KEY_STATE_PRESSED);
+            }));
+            expectEquals (recorder.resets, 0);
+            expectEquals (recorder.keyEvents, 1);
+            expect (state.hasKeyboardFocus());
+            state.detach (token);
+        }
+
+        beginTest ("Device removal resets before release and replays only surviving input");
+        {
+            WaylandInputState state;
+            Recorder recorder;
+            auto* surface = reinterpret_cast<wl_surface*> (&recorder);
+            wl_array keys { 0, 0, nullptr };
+            int descriptors[2] { -1, -1 };
+            expectEquals (pipe (descriptors), 0);
+            if (descriptors[0] < 0)
+                return;
+            close (descriptors[1]);
+            state.keymap (nullptr, 1, descriptors[0], 1);
+            state.repeatInfo (nullptr, 25, 500);
+            state.keyboardEnter (nullptr, 1, surface, &keys);
+            state.modifiers (nullptr, 2, 1, 0, 0, 0);
+            state.pointerEnter (nullptr, 3, surface, 256, 512);
+            const auto token = state.attach (recorder.forwarder());
+            recorder.consume = true;
+            expect (state.key (nullptr, 4, 5, 30, WL_KEYBOARD_KEY_STATE_PRESSED));
+            expect (state.button (nullptr, 6, 7, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED));
+            recorder.events.clear();
+            recorder.onReset = [&] { expect (fcntl (descriptors[0], F_GETFD) >= 0); };
+            bool released = false;
+            expect (state.replaceDevices (true, false, [&] {
+                expectEquals (recorder.resets, 1);
+                expect (fcntl (descriptors[0], F_GETFD) < 0);
+                state.key (nullptr, 8, 9, 31, WL_KEYBOARD_KEY_STATE_PRESSED);
+                expectEquals (recorder.keyEvents, 1);
+                expect (state.attach (recorder.forwarder()) == 0);
+                released = true;
+            }));
+            expect (released);
+            expect (recorder.events == std::vector<int> ({ 5 }));
+            expect (! state.key (nullptr, 10, 11, 30, WL_KEYBOARD_KEY_STATE_RELEASED));
+            expect (state.button (nullptr, 12, 13, BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED));
+            recorder.onReset = {};
+            state.detach (token);
+        }
+
+        beginTest ("Proxy removal waits for a forwarded callback to return");
+        {
+            WaylandInputState state;
+            Recorder recorder;
+            const auto token = state.attach (recorder.forwarder());
+            bool released = false;
+            recorder.onKey = [&] {
+                expect (! state.replaceDevices (true, true, [&] { released = true; }));
+                expectEquals (recorder.resets, 0);
+            };
+            state.key (nullptr, 1, 2, 30, WL_KEYBOARD_KEY_STATE_PRESSED);
+            expect (! released);
+            recorder.onKey = {};
+            expect (state.replaceDevices (true, true, [&] { released = true; }));
+            expect (released);
+            expectEquals (recorder.resets, 1);
+            state.detach (token);
+        }
+
+        beginTest ("Detach from reset prevents replay to a retired consumer");
+        {
+            WaylandInputState state;
+            Recorder recorder;
+            auto* surface = reinterpret_cast<wl_surface*> (&recorder);
+            state.pointerEnter (nullptr, 1, surface, 0, 0);
+            const auto token = state.attach (recorder.forwarder());
+            recorder.events.clear();
+            recorder.onReset = [&] { expect (state.detach (token)); };
+            expect (state.replaceDevices (true, false, [] {}));
+            expectEquals (recorder.resets, 1);
+            expect (recorder.events.empty());
+            expect (! state.detach (token));
+        }
+
         beginTest ("Actual keyboard leave clears consumed keys and focus release is forwarded");
         {
             WaylandInputState state;
