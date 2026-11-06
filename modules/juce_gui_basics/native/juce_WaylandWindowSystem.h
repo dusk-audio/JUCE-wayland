@@ -6,6 +6,8 @@
 namespace juce
 {
 
+struct WaylandInputState;
+struct WaylandPipeTransfer;
 struct WaylandWindow;
 struct WaylandDisplay;
 struct WaylandShmBuffer;
@@ -29,6 +31,30 @@ enum class MouseEventFlags
 class WaylandWindowSystem : public DeletedAtShutdown
 {
 public:
+    struct InputForwarder
+    {
+        const wl_keyboard_listener* keyboard = nullptr;
+        const wl_pointer_listener* pointer = nullptr;
+        void* data = nullptr;
+        bool (*consumed) (void*) = nullptr;
+        bool (*hasKeyboardFocus) (void*) = nullptr;
+        void (*releaseFocus) (void*) = nullptr;
+        void (*reset) (void*) = nullptr;
+        std::shared_ptr<void> lifetime {};
+    };
+
+    // Message-thread only. Optional lifetime ownership survives callbacks and final reset.
+    // Without it, the caller must keep the target alive through reset.
+    // Listeners receive a duplicate keymap FD and must close it. Do not install
+    // these listeners on the host's proxies. Detach before destroying the target.
+    // consumed is queried only after key/button. Attach replays current input and
+    // returns zero on failure; only its returned token may detach that registration.
+    // Forget an embedded surface before destroying it to prevent stale focus replay.
+    uint64 attachInputForwarder (const InputForwarder&);
+    void detachInputForwarder (uint64 registration);
+    void forgetInputSurface (wl_surface*);
+    wl_seat* getSeat() const noexcept { return seat; }
+
     bool isWaylandAvailable();
     bool isTouchAvailable();
 
@@ -82,6 +108,9 @@ public:
     
     wl_surface* getSurfaceForWindow (WaylandWindow* window);
     void commit (WaylandWindow* window);
+    // Latch child changes now, or on the next configured content frame. False for unknown surfaces.
+    bool commitEmbeddedChildren (wl_surface*);
+    bool isSurfaceMapped (wl_surface*) const;
     void requestFrame (WaylandWindow* window);
     
     // Cursor interface
@@ -127,26 +156,26 @@ private:
     // Drag and drop helpers
     void setupDragSource (WaylandWindow* window, bool isText, bool canMoveFiles);
     void writeDataToFd (int fd, const String& data) const;
-    void readOfferData (const String& mimeType, std::function<void (const String&)> callback) const            ;
+    void readOfferData (wl_data_offer*, const String& mimeType, std::function<void (const String&)> callback);
+    void releaseOffer (wl_data_offer*);
     
     // Z-order management
     void enforceOrder();
-    std::vector<WaylandWindow*> getSubsurfacesForParent (WaylandWindow* parent) const;
     auto findInZOrder (WaylandWindow* window) { return std::find (zOrder.begin(), zOrder.end(), window); }
     
     // Input event handling
     void handleMouseEvent (WaylandWindow* window);
     void handleTouchEvent (WaylandWindow* window, Point<float> localPos, int touchIndex, MouseEventFlags eventType);
-    void handleKeyEvent (WaylandWindow* window, uint32_t waylandKey, bool pressed);
+    void handleKeyEvent (WaylandWindow* window, uint32_t waylandKey, bool pressed, bool dispatchToWidgets);
     void handleKeyRepeat();
     void updateMouseModifiers (uint32_t button, bool pressed);
     
-    wl_display* display;
-    wl_registry* registry;
-    wl_compositor* compositor;
-    wl_subcompositor* subcompositor;
-    wl_shm* shm;
-    wl_seat* seat;
+    wl_display* display = nullptr;
+    wl_registry* registry = nullptr;
+    wl_compositor* compositor = nullptr;
+    wl_subcompositor* subcompositor = nullptr;
+    wl_shm* shm = nullptr;
+    wl_seat* seat = nullptr;
     libdecor* decorator = nullptr;
     
     xkb_state* xkbState = nullptr;
@@ -171,17 +200,18 @@ private:
     WaylandWindow* lastFocusedWindow = nullptr;
     
     // Global input objects
-    wl_keyboard* globalKeyboard;
-    wl_pointer* globalPointer;
-    wl_touch* globalTouch;
+    wl_keyboard* globalKeyboard = nullptr;
+    wl_pointer* globalPointer = nullptr;
+    wl_touch* globalTouch = nullptr;
     
     TimedCallback keyRepeater = TimedCallback ([this](){ handleKeyRepeat(); });
     std::pair<int, juce_wchar> lastKey;
     std::set<int> keysCurrentlyDown;
-    int keyRepeatRate, keyRepeatDelay;
+    int keyRepeatRate = 0, keyRepeatDelay = 0;
     
     Point<float> currentMousePosition;
     uint32_t currentMouseSerial = 0;
+    uint32_t grabSerial = 0;
     uint32_t currentMouseTime = 0;
     
     uint32_t currentTouchTime = 0;
@@ -190,10 +220,10 @@ private:
     bool hasMouse = false;
     bool hasKeyboard = false;
     
-    wl_data_device_manager* dataDeviceManager;
-    wl_data_device* dataDevice;
-    wl_data_source* dragSource;
-    wl_data_source* clipboardSource;
+    wl_data_device_manager* dataDeviceManager = nullptr;
+    wl_data_device* dataDevice = nullptr;
+    wl_data_source* dragSource = nullptr;
+    wl_data_source* clipboardSource = nullptr;
     
     // For sending drag and drop
     std::function<void()> dragCompletionCallback;
@@ -202,15 +232,19 @@ private:
     
     // For receiving drag and drop
     ComponentPeer::DragInfo currentDragInfo;
-    wl_data_offer* currentOffer;
+    wl_data_offer* currentOffer = nullptr;
     WaylandWindow* dragTargetWindow = nullptr;
-    bool isDraggingText = false;
-    bool isDraggingFiles = false;
+    struct OfferTypes { String text; bool files = false; };
+    std::map<wl_data_offer*, OfferTypes> offers;
   
     // Clipboard state
     String currentClipboardText;
-    bool hasClipboardData = false;
+    String publishedClipboardText;
+    wl_data_offer* clipboardOffer = nullptr;
+    uint64 clipboardGeneration = 0;
+    WaylandPipeTransfer* activeTransfer = nullptr;
   
+    std::unique_ptr<WaylandInputState> inputState;
     bool initialised = false;
   
 public:

@@ -3,8 +3,147 @@
  // Distributed under the GPLv3 license
  */
 
+#include "juce_WaylandInputState.h"
+
 namespace juce
 {
+
+struct WaylandPipeTransfer
+{
+    explicit WaylandPipeTransfer (int descriptor) : fd (descriptor)
+    {
+        const auto flags = fcntl (fd, F_GETFL, 0);
+        failed = flags < 0 || fcntl (fd, F_SETFL, flags | O_NONBLOCK) < 0;
+    }
+    ~WaylandPipeTransfer() { if (fd >= 0) close (fd); }
+    WaylandPipeTransfer (const WaylandPipeTransfer&) = delete;
+    WaylandPipeTransfer& operator= (const WaylandPipeTransfer&) = delete;
+
+    void drain()
+    {
+        char buffer[8192];
+        while (! complete && ! failed)
+        {
+            const auto count = read (fd, buffer, sizeof buffer);
+            if (count > 0)
+            {
+                if (bytes.size() + static_cast<size_t> (count) > 64u * 1024u * 1024u)
+                {
+                    failed = true;
+                    return;
+                }
+                try { bytes.insert (bytes.end(), buffer, buffer + count); }
+                catch (...) { failed = true; }
+            }
+            else if (count == 0)
+            {
+                complete = true;
+            }
+            else if (errno != EINTR)
+            {
+                failed = errno != EAGAIN && errno != EWOULDBLOCK;
+                return;
+            }
+        }
+    }
+
+    using Clock = std::chrono::steady_clock;
+    static int millisecondsLeft (Clock::time_point deadline)
+    {
+        return static_cast<int> (std::max<int64_t> (0,
+            std::chrono::duration_cast<std::chrono::milliseconds> (deadline - Clock::now()).count()));
+    }
+
+    bool receive (int timeoutMs = 1000)
+    {
+        const auto deadline = Clock::now() + std::chrono::milliseconds (timeoutMs);
+        while (! complete && ! failed)
+        {
+            drain();
+            if (complete || failed) break;
+            const auto remaining = millisecondsLeft (deadline);
+            if (remaining == 0) { failed = true; break; }
+            pollfd request { fd, POLLIN, 0 };
+            const auto result = poll (&request, 1, remaining);
+            if (result < 0 && errno == EINTR) continue;
+            if (result <= 0 || (request.revents & POLLNVAL)) failed = true;
+        }
+        return complete && ! failed;
+    }
+
+    static bool send (int descriptor, const char* data, size_t size,
+                      WaylandPipeTransfer* receiver, int timeoutMs = 1000)
+    {
+        struct CloseFd { int value; ~CloseFd() { close (value); } } owned { descriptor };
+        const auto flags = fcntl (descriptor, F_GETFL, 0);
+        if (flags < 0 || fcntl (descriptor, F_SETFL, flags | O_NONBLOCK) < 0) return false;
+
+        struct PipeSignal
+        {
+            PipeSignal()
+            {
+                sigemptyset (&onlyPipe);
+                sigaddset (&onlyPipe, SIGPIPE);
+                blocked = pthread_sigmask (SIG_BLOCK, &onlyPipe, &saved) == 0;
+                sigset_t pending;
+                alreadyPending = sigpending (&pending) != 0 || sigismember (&pending, SIGPIPE);
+            }
+            ~PipeSignal()
+            {
+                if (! blocked) return;
+                // Leave a caller-owned pending or blocked signal untouched.
+                if (broken && ! alreadyPending && ! sigismember (&saved, SIGPIPE))
+                {
+                    const timespec zero {};
+                    while (sigtimedwait (&onlyPipe, nullptr, &zero) < 0 && errno == EINTR) {}
+                }
+                pthread_sigmask (SIG_SETMASK, &saved, nullptr);
+            }
+            sigset_t saved {}, onlyPipe {};
+            bool blocked = false, alreadyPending = false, broken = false;
+        } signal;
+        if (! signal.blocked) return false;
+
+        const auto deadline = Clock::now() + std::chrono::milliseconds (timeoutMs);
+        size_t offset = 0;
+        while (offset < size)
+        {
+            if (millisecondsLeft (deadline) == 0) return false;
+            const auto written = write (descriptor, data + offset, size - offset);
+            if (written > 0)
+            {
+                offset += static_cast<size_t> (written);
+                continue;
+            }
+            if (written < 0 && errno == EINTR) continue;
+            if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            {
+                // A self-paste cannot resume its receive loop until this callback returns.
+                const bool drainReceiver = receiver && ! receiver->complete && ! receiver->failed;
+                pollfd requests[2] { { descriptor, POLLOUT, 0 },
+                                    { drainReceiver ? receiver->fd : -1, POLLIN, 0 } };
+                const auto result = poll (requests, drainReceiver ? 2 : 1, millisecondsLeft (deadline));
+                if (result < 0 && errno == EINTR) continue;
+                if (result <= 0) return false;
+                if (drainReceiver && (requests[1].revents & (POLLIN | POLLHUP | POLLERR)))
+                {
+                    receiver->drain();
+                    if (receiver->failed) return false;
+                }
+                if (requests[0].revents & (POLLERR | POLLHUP | POLLNVAL)) return false;
+                continue;
+            }
+            signal.broken = written < 0 && errno == EPIPE;
+            return false;
+        }
+        return true;
+    }
+
+    int fd;
+    std::vector<char> bytes;
+    bool complete = false, failed = false;
+};
+
 
 struct WaylandShmBuffer {
     wl_buffer* buffer;
@@ -93,13 +232,17 @@ struct WaylandWindow {
         wl_subsurface* subsurface;
     } handle;
     wl_callback* frameCallback = nullptr;
+    wl_callback* remapBarrier = nullptr;
     WaylandWindow* parentWindow = nullptr;
     WaylandComponentPeer* peer;
     std::unique_ptr<WaylandShmBuffer> currentBuffer = nullptr;
     std::set<wl_output*> displays;
     Rectangle<int> bounds;
     uint16 bufferScale = 1;
-    bool isVisible:1 = true;
+    bool isVisible:1 = false;
+    bool configureRequested = false;
+    bool configured = false;
+    bool contentMapped = false;
     bool isFullscreen:1 = false;
     bool isMinimised:1 = false;
     bool isActivated:1 = false;
@@ -120,6 +263,7 @@ struct WaylandDisplay {
 };
 
 WaylandWindowSystem::WaylandWindowSystem()
+    : inputState (std::make_unique<WaylandInputState>())
 {
     if (initialised) return;
     
@@ -162,7 +306,7 @@ WaylandWindowSystem::WaylandWindowSystem()
             {
                 self->shm = static_cast<wl_shm*>(WaylandSymbols::getInstance()->registryBind (r, name, WaylandSymbols::getInstance()->shmInterface, std::min (version, 1u)));
             }
-            else if (interface =="wl_seat")
+            else if (interface == "wl_seat" && ! self->seat)
             {
                 self->seat = static_cast<wl_seat*>(WaylandSymbols::getInstance()->registryBind (r, name, WaylandSymbols::getInstance()->seatInterface, std::min (version, 7u)));
                 
@@ -230,6 +374,20 @@ WaylandWindowSystem::WaylandWindowSystem()
 
 WaylandWindowSystem::~WaylandWindowSystem()
 {
+    initialised = false;
+    keyRepeater.stopTimer();
+    inputState.reset();
+    for (const auto& offer : offers)
+        WaylandSymbols::getInstance()->dataOfferDestroy (offer.first);
+    if (clipboardSource)
+        WaylandSymbols::getInstance()->dataSourceDestroy (clipboardSource);
+    if (dragSource)
+        WaylandSymbols::getInstance()->dataSourceDestroy (dragSource);
+    if (dataDevice)
+        WaylandSymbols::getInstance()->dataDeviceDestroy (dataDevice);
+    if (dataDeviceManager)
+        WaylandSymbols::getInstance()->dataDeviceManagerDestroy (dataDeviceManager);
+
     customCursors.clear();
     if (cursorTheme)
         WaylandSymbols::getInstance()->cursorThemeDestroy (cursorTheme);
@@ -286,9 +444,6 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
     
     updateRegions (window);
     
-    static bool isConfigured;
-    isConfigured = false;
-
     if (isSubsurface)
     {
         window->handle.subsurface = WaylandSymbols::getInstance()->subcompositorGetSubsurface (subcompositor, window->surface, window->parentWindow->surface);
@@ -299,7 +454,7 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
         WaylandSymbols::getInstance()->surfaceSetBufferScale (window->surface, window->bufferScale);
         
         WaylandSymbols::getInstance()->surfaceCommit (window->surface);
-        WaylandSymbols::getInstance()->surfaceCommit (window->parentWindow->surface);
+        commitEmbeddedChildren (window->parentWindow->surface);
     }
     else
     {
@@ -320,6 +475,8 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
             .configure = [] (libdecor_frame* frame, libdecor_configuration* configuration, void* data)
             {
                 auto* w = static_cast<WaylandWindow*> (data);
+                if (! w->configureRequested)
+                    return;
                 if (! ComponentPeer::isValidPeer (w->peer))
                 {
                     auto* state = WaylandSymbols::getInstance()->decorStateNew (1, 1);
@@ -327,7 +484,9 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
                     if (state) WaylandSymbols::getInstance()->decorStateFree (state);
                     return;
                 }
-                bool wasActivated = w->isActivated;
+                const bool wasActivated = w->isActivated;
+                auto* const configuredPeer = w->peer;
+                auto* const configuredSurface = w->surface;
                     
                 int windowState;
                 if (WaylandSymbols::getInstance()->decorConfigurationGetWindowState (configuration, &windowState))
@@ -338,38 +497,33 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
                 }
                 
                 WaylandComponentPeer::isActiveApplication = false;
-                for(auto& [surface, window] : WaylandWindowSystem::getInstance()->surfaceToWindow)
+                for (const auto& entry : WaylandWindowSystem::getInstance()->surfaceToWindow)
                 {
-                    if(window->isActivated)
+                    if (entry.second->isActivated)
                     {
                         WaylandComponentPeer::isActiveApplication = true;
                         break;
                     }
                 }
                 
-                if (! wasActivated && w->isActivated)
-                {
-                    w->peer->handleBroughtToFront();
-                }
-                
-                int width = std::max (1, (int)(w->peer->getComponent().getWidth()));
-                int height = std::max (1, (int)(w->peer->getComponent().getHeight()));
-                if (WaylandSymbols::getInstance()->decorConfigurationGetContentSize (configuration, frame, &width, &height))
-                {
-                    if (width > 0 && height > 0)
-                    {
-                        w->bounds.setSize (width, height);
-                        w->peer->setBounds (Rectangle<int>(0, 0, width, height), w->isFullscreen);
-                        w->peer->repaint (Rectangle<int>(0, 0, width, height));
-                    }
-                }
-                
+                int width = std::max (1, w->bounds.getWidth());
+                int height = std::max (1, w->bounds.getHeight());
+                WaylandSymbols::getInstance()->decorConfigurationGetContentSize (configuration, frame, &width, &height);
+                width = std::max (1, width);
+                height = std::max (1, height);
                 auto* state = WaylandSymbols::getInstance()->decorStateNew (width, height);
                 WaylandSymbols::getInstance()->decorFrameCommit (frame, state, configuration);
                 WaylandSymbols::getInstance()->decorStateFree (state);
+                w->configured = true;
 
+                // Resizing or focus callbacks may destroy the peer or submit a frame.
+                configuredPeer->setBounds (Rectangle<int> (0, 0, width, height), w->isFullscreen);
+                if (getInstance()->findWindowBySurface (configuredSurface) != w || ! ComponentPeer::isValidPeer (configuredPeer))
+                    return;
                 getInstance()->updateRegions (w);
-                isConfigured = true;
+                configuredPeer->repaint (Rectangle<int> (0, 0, width, height));
+                if (! wasActivated && w->isActivated)
+                    configuredPeer->handleBroughtToFront();
             },
                 .close = [] (libdecor_frame*, void* user_data){
                     auto* w = static_cast<WaylandWindow*> (user_data);
@@ -383,7 +537,6 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
         
         
         window->handle.frame = WaylandSymbols::getInstance()->decorDecorate (decorator, window->surface, &frame_interface, window);
-        WaylandSymbols::getInstance()->decorFrameSetCapabilities (window->handle.frame, (libdecor_capabilities)capabilities);
         
         if (! window->handle.frame)
         {
@@ -392,27 +545,11 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
             return nullptr;
         }
         
-        WaylandSymbols::getInstance()->decorFrameMap (window->handle.frame);
-        WaylandSymbols::getInstance()->surfaceCommit (window->surface);
-        
-        // Wait for initial configure
-        int timeout = 50;
-        while (! isConfigured && timeout-- > 0)
-        {
-            WaylandSymbols::getInstance()->displayDispatchPending (display);
-            if (! isConfigured)
-            {
-                usleep (10000);
-                WaylandSymbols::getInstance()->displayDispatch (display);
-            }
-        }
-        
+        WaylandSymbols::getInstance()->decorFrameSetCapabilities (window->handle.frame, (libdecor_capabilities)capabilities);
+
         if (! (styleFlags & ComponentPeer::windowHasTitleBar))
             WaylandSymbols::getInstance()->decorFrameSetVisibility (window->handle.frame, false);
     }
-    
-    if (! lastFocusedWindow)
-        lastFocusedWindow = (window->parentWindow || ! window->isVisible) ? lastFocusedWindow : window;
     
     surfaceToWindow[window->surface] = window;
     
@@ -439,7 +576,8 @@ int WaylandWindowSystem::getScaleFactorForWindow (WaylandWindow* window)
 
 void WaylandWindowSystem::requestFrame (WaylandWindow* window)
 {
-    if (! window || ! window->surface || window->frameCallback)
+    if (! window || ! window->surface || window->frameCallback
+        || ! window->isVisible || (! window->parentWindow && ! window->configured))
         return;
     
     static const wl_callback_listener frameListener = {
@@ -517,13 +655,14 @@ void WaylandWindowSystem::updateConstraints (WaylandWindow* window) const
         WaylandSymbols::getInstance()->decorFrameSetMaxContentSize (window->handle.frame, 0, 0);
     }
     
-    // Commit the frame to apply changes immediately
-    WaylandSymbols::getInstance()->decorFrameCommit (window->handle.frame, nullptr, nullptr);
+    window->peer->repaint (window->bounds.withZeroOrigin());
 }
 
 void WaylandWindowSystem::destroyWindow (WaylandWindow* window)
 {
-    if (hasTouch)
+    forgetInputSurface (window->surface);
+    if (dragTargetWindow == window) dragTargetWindow = nullptr;
+    if (currentTouches)
         currentTouches->deleteAllTouchesForPeer (window->peer);
     
     auto it = findInZOrder (window);
@@ -532,7 +671,9 @@ void WaylandWindowSystem::destroyWindow (WaylandWindow* window)
     
     if (window->frameCallback)
         WaylandSymbols::getInstance()->callbackDestroy (window->frameCallback);
-    
+    if (window->remapBarrier)
+        WaylandSymbols::getInstance()->callbackDestroy (window->remapBarrier);
+
     if (window->parentWindow)
         WaylandSymbols::getInstance()->subsurfaceDestroy (window->handle.subsurface);
     else
@@ -566,13 +707,12 @@ void WaylandWindowSystem::setBounds (WaylandWindow* window, Rectangle<int> b)
         window->bounds = b;
         WaylandSymbols::getInstance()->subsurfaceSetPosition (window->handle.subsurface, window->bounds.getX(), window->bounds.getY());
         WaylandSymbols::getInstance()->surfaceCommit (window->surface);
-        WaylandSymbols::getInstance()->surfaceCommit (window->parentWindow->surface);
+        commitEmbeddedChildren (window->parentWindow->surface);
     }
     else
     {
         window->bounds = b.withZeroOrigin();
-        auto* state = WaylandSymbols::getInstance()->decorStateNew (b.getWidth(), b.getHeight());
-        WaylandSymbols::getInstance()->decorFrameCommit (window->handle.frame, state, nullptr);
+        window->peer->repaint (window->bounds);
     }
 }
 
@@ -606,9 +746,9 @@ void WaylandWindowSystem::startHostManagedResize (WaylandWindow* window, Resizab
     }();
     
     if (edge == LIBDECOR_RESIZE_EDGE_NONE)
-        WaylandSymbols::getInstance()->decorFrameMove (window->handle.frame, seat, currentMouseSerial);
+        WaylandSymbols::getInstance()->decorFrameMove (window->handle.frame, seat, grabSerial);
     else
-        WaylandSymbols::getInstance()->decorFrameResize (window->handle.frame, seat, currentMouseSerial, edge);
+        WaylandSymbols::getInstance()->decorFrameResize (window->handle.frame, seat, grabSerial, edge);
 }
 
 void WaylandWindowSystem::toFront (WaylandWindow* window, bool commit)
@@ -742,7 +882,7 @@ void WaylandWindowSystem::enforceOrder()
         for (auto* s : subsurfacesBelow)
             WaylandSymbols::getInstance()->surfaceCommit (s->surface);
 
-        WaylandSymbols::getInstance()->surfaceCommit (parent->surface);
+        commitEmbeddedChildren (parent->surface);
 
         for (auto* s : subsurfacesAbove)
             WaylandSymbols::getInstance()->surfaceCommit (s->surface);
@@ -752,29 +892,52 @@ void WaylandWindowSystem::enforceOrder()
 void WaylandWindowSystem::setVisible (WaylandWindow* window, bool shouldBeVisible)
 {
     window->isVisible = shouldBeVisible;
+    updateRegions (window);
     if (shouldBeVisible)
     {
-        if (window->currentBuffer)
+        if (! window->parentWindow && ! lastFocusedWindow)
+            lastFocusedWindow = window;
+        if (! window->parentWindow && ! window->configureRequested && ! window->remapBarrier)
         {
-            WaylandSymbols::getInstance()->surfaceAttach (window->surface, window->currentBuffer->buffer, 0, 0);
-            WaylandSymbols::getInstance()->surfaceCommit (window->surface);
+            window->configureRequested = true;
+            WaylandSymbols::getInstance()->decorFrameMap (window->handle.frame);
         }
-        requestFrame (window);
-        if (window->parentWindow)
-        {
-            WaylandSymbols::getInstance()->surfaceCommit (window->parentWindow->surface);
-        }
+        window->peer->repaint (window->bounds.withZeroOrigin());
+        return;
     }
-    else
+
+    if (window->frameCallback)
     {
-        WaylandSymbols::getInstance()->surfaceAttach (window->surface, nullptr, 0, 0);
-        WaylandSymbols::getInstance()->surfaceCommit (window->surface);
-        if (window->parentWindow)
-        {
-            WaylandSymbols::getInstance()->surfaceCommit (window->parentWindow->surface);
-        }
+        WaylandSymbols::getInstance()->callbackDestroy (window->frameCallback);
+        window->frameCallback = nullptr;
     }
-    updateRegions (window);
+    if (! window->contentMapped)
+        return;
+
+    WaylandSymbols::getInstance()->surfaceAttach (window->surface, nullptr, 0, 0);
+    WaylandSymbols::getInstance()->surfaceCommit (window->surface);
+    window->contentMapped = false;
+    if (window->parentWindow)
+    {
+        commitEmbeddedChildren (window->parentWindow->surface);
+        return;
+    }
+
+    window->configured = false;
+    window->configureRequested = false;
+    // Drain old configure events before requesting the next mapping generation.
+    static const wl_callback_listener listener {
+        [] (void* data, wl_callback* callback, uint32)
+        {
+            auto* w = static_cast<WaylandWindow*> (data);
+            WaylandSymbols::getInstance()->callbackDestroy (callback);
+            w->remapBarrier = nullptr;
+            if (w->isVisible)
+                getInstance()->setVisible (w, true);
+        }
+    };
+    window->remapBarrier = WaylandSymbols::getInstance()->displaySync (display);
+    WaylandSymbols::getInstance()->callbackAddListener (window->remapBarrier, &listener, window);
 }
 
 void WaylandWindowSystem::setFullscreen (WaylandWindow* window, bool shouldBeFullscreen)
@@ -825,7 +988,8 @@ void WaylandWindowSystem::blitToWindow (WaylandWindow* window, const Image& imag
     int windowWidth = window->bounds.getWidth() * bufferScale;
     int windowHeight = window->bounds.getHeight() * bufferScale;
         
-    if (windowWidth <= 0 || windowHeight <= 0 || ! window->isVisible)
+    if (windowWidth <= 0 || windowHeight <= 0 || ! window->isVisible
+        || (! window->parentWindow && ! window->configured))
         return;
     
     auto& currentBuffer = window->currentBuffer;
@@ -834,7 +998,6 @@ void WaylandWindowSystem::blitToWindow (WaylandWindow* window, const Image& imag
         try
         {
             currentBuffer = std::make_unique<WaylandShmBuffer> (windowWidth, windowHeight);
-            WaylandSymbols::getInstance()->surfaceAttach (window->surface, currentBuffer->buffer, 0, 0);
         }
         catch (...)
         {
@@ -951,6 +1114,28 @@ bool WaylandWindowSystem::isTouchAvailable()
   return hasTouch;
 }
 
+uint64 WaylandWindowSystem::attachInputForwarder (const InputForwarder& forwarder)
+{
+    if (! initialised)
+        return 0;
+    const auto token = inputState->attach (forwarder);
+    if (inputState->hasKeyboardFocus())
+        keyRepeater.stopTimer();
+    return token;
+}
+
+void WaylandWindowSystem::detachInputForwarder (uint64 registration)
+{
+    if (inputState && inputState->detach (registration))
+        inputState->forgetForeignSurfaces ([this] (wl_surface* surface) { return findWindowBySurface (surface) != nullptr; });
+}
+
+void WaylandWindowSystem::forgetInputSurface (wl_surface* surface)
+{
+    if (inputState)
+        inputState->forgetSurface (surface);
+}
+
 void WaylandWindowSystem::setupGlobalInput()
 {
     if (! seat)
@@ -959,14 +1144,19 @@ void WaylandWindowSystem::setupGlobalInput()
     // Keyboard setup
     static const wl_keyboard_listener keyboardListener =
     {
-        .keymap = [] (void* data, wl_keyboard*, uint32, int32 fd, uint32 size)
+        .keymap = [] (void* data, wl_keyboard* proxy, uint32 format, int32 fd, uint32 size)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
-            self->setupKeymap (fd, size);
+            self->inputState->keymap (proxy, format, fd, size);
+            if (format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1)
+                self->setupKeymap (fd, size);
         },
-        .enter = [] (void* data, wl_keyboard*, uint32, wl_surface* surface, wl_array*)
+        .enter = [] (void* data, wl_keyboard* proxy, uint32 serial, wl_surface* surface, wl_array* keys)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
+            self->inputState->keyboardEnter (proxy, serial, surface, keys);
+            if (self->inputState->hasKeyboardFocus())
+                self->keyRepeater.stopTimer();
             if (auto* window = self->findWindowBySurface (surface))
             {
                 if (! window->ignoresKeyboard) {
@@ -977,14 +1167,16 @@ void WaylandWindowSystem::setupGlobalInput()
                 if (! self->lastFocusedWindow) self->lastFocusedWindow = (window->parentWindow || ! window->isVisible) ? self->lastFocusedWindow : window;
             }
         },
-        .leave = [] (void* data, wl_keyboard*, uint32, wl_surface* surface)
+        .leave = [] (void* data, wl_keyboard* proxy, uint32 serial, wl_surface* surface)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
+            const auto forwardedFocus = self->inputState->hasKeyboardFocus();
+            self->inputState->keyboardLeave (proxy, serial, surface);
             WaylandWindow* window = self->findWindowBySurface (surface);
             if (! self->keysCurrentlyDown.empty())
             {
                 self->keysCurrentlyDown.clear();
-                if (self->keyboardFocused)
+                if (self->keyboardFocused && ! forwardedFocus)
                     self->keyboardFocused->peer->handleKeyUpOrDown (false);
             }
             self->keyRepeater.stopTimer();
@@ -993,39 +1185,49 @@ void WaylandWindowSystem::setupGlobalInput()
                 window->peer->handleFocusLoss();
             }
         },
-        .key = [] (void* data, wl_keyboard*, uint32, uint32, uint32 key, uint32 state)
+        .key = [] (void* data, wl_keyboard* proxy, uint32 serial, uint32 time, uint32 key, uint32 state)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
-            if (auto* window = self->keyboardFocused)
-                self->handleKeyEvent (window, key, state == WL_KEYBOARD_KEY_STATE_PRESSED);
+            self->currentMouseSerial = serial;
+            const auto consumed = self->inputState->key (proxy, serial, time, key, state);
+            if (consumed || self->inputState->hasKeyboardFocus())
+                self->keyRepeater.stopTimer();
+            self->handleKeyEvent (self->keyboardFocused, key, state == WL_KEYBOARD_KEY_STATE_PRESSED, ! consumed);
         },
-        .modifiers = [] (void* data, wl_keyboard*, uint32, uint32 depressed, uint32 latched, uint32 locked, uint32 group)
+        .modifiers = [] (void* data, wl_keyboard* proxy, uint32 serial, uint32 depressed, uint32 latched, uint32 locked, uint32 group)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
-            if (auto* window = self->keyboardFocused)
+            self->inputState->modifiers (proxy, serial, depressed, latched, locked, group);
+            if (self->xkbState)
+                WaylandSymbols::getInstance()->xkbStateUpdateMask (self->xkbState, depressed, latched, locked, 0, 0, group);
+
+            ModifierKeys::currentModifiers = self->getNativeRealtimeModifiers();
+            if (self->inputState->hasKeyboardFocus())
+                self->keyRepeater.stopTimer();
+            else if (auto* window = self->keyboardFocused)
             {
-                if (self->xkbState)
-                    WaylandSymbols::getInstance()->xkbStateUpdateMask (self->xkbState, depressed, latched, locked, 0, 0, group);
-                
-                ModifierKeys::currentModifiers = self->getNativeRealtimeModifiers();
                 window->peer->handleModifierKeysChange();
                 window->peer->handleKeyUpOrDown (depressed);
             }
         },
-        .repeat_info = [] (void* data, wl_keyboard*, int32 rate, int32 delay)
+        .repeat_info = [] (void* data, wl_keyboard* proxy, int32 rate, int32 delay)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
             self->keyRepeatRate = rate;
             self->keyRepeatDelay = delay;
+            self->inputState->repeatInfo (proxy, rate, delay);
         }
     };
     
     // Pointer setup
     static const wl_pointer_listener pointerListener =
     {
-        .enter = [] (void* data, wl_pointer*, uint32 serial, wl_surface* surface, wl_fixed_t x, wl_fixed_t y)
+        .enter = [] (void* data, wl_pointer* proxy, uint32 serial, wl_surface* surface, wl_fixed_t x, wl_fixed_t y)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
+            self->currentMouseSerial = serial;
+            self->pointerFocused = nullptr;
+            self->inputState->pointerEnter (proxy, serial, surface, x, y);
             if (auto* window = self->findWindowBySurface (surface))
             {
                 self->currentMousePosition = window->peer->localToGlobal (WaylandSymbols::getInstance()->fixedToPoint<float>(x, y));
@@ -1038,7 +1240,7 @@ void WaylandWindowSystem::setupGlobalInput()
                 self->handleMouseEvent (window);
             }
         },
-        .leave = [] (void* data, wl_pointer*, uint32, wl_surface* surface)
+        .leave = [] (void* data, wl_pointer* proxy, uint32 serial, wl_surface* surface)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
 
@@ -1046,21 +1248,26 @@ void WaylandWindowSystem::setupGlobalInput()
             if (ModifierKeys::currentModifiers.isLeftButtonDown())
             {
                 self->updateMouseModifiers (BTN_LEFT, false);
-                if (auto* window = self->findWindowBySurface (surface))
-                  self->handleMouseEvent (window);
+                if (! self->inputState->isButtonConsumed (BTN_LEFT))
+                    if (auto* window = self->findWindowBySurface (surface))
+                        self->handleMouseEvent (window);
             }
             if (ModifierKeys::currentModifiers.isRightButtonDown())
             {
                 self->updateMouseModifiers (BTN_RIGHT, false);
-                if (auto* window = self->findWindowBySurface (surface))
-                  self->handleMouseEvent (window);
+                if (! self->inputState->isButtonConsumed (BTN_RIGHT))
+                    if (auto* window = self->findWindowBySurface (surface))
+                        self->handleMouseEvent (window);
             }
             if (ModifierKeys::currentModifiers.isMiddleButtonDown())
             {
                 self->updateMouseModifiers (BTN_MIDDLE, false);
-                if (auto* window = self->findWindowBySurface (surface))
-                  self->handleMouseEvent (window);
+                if (! self->inputState->isButtonConsumed (BTN_MIDDLE))
+                    if (auto* window = self->findWindowBySurface (surface))
+                        self->handleMouseEvent (window);
             }
+
+            self->inputState->pointerLeave (proxy, serial, surface);
 
             if (auto* window = self->findWindowBySurface (surface))
             {
@@ -1075,9 +1282,10 @@ void WaylandWindowSystem::setupGlobalInput()
             }
             self->pointerFocused = nullptr;
         },
-        .motion = [] (void* data, wl_pointer*, uint32 time, wl_fixed_t x, wl_fixed_t y)
+        .motion = [] (void* data, wl_pointer* proxy, uint32 time, wl_fixed_t x, wl_fixed_t y)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
+            self->inputState->pointerMotion (proxy, time, x, y);
             if (auto* window = self->pointerFocused)
             {
                 self->currentMouseTime = time;
@@ -1085,14 +1293,24 @@ void WaylandWindowSystem::setupGlobalInput()
                 self->handleMouseEvent (window);
             }
         },
-        .button = [] (void* data, wl_pointer*, uint32 serial, uint32 time, uint32 button, uint32 state)
+        .button = [] (void* data, wl_pointer* proxy, uint32 serial, uint32 time, uint32 button, uint32 state)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
+            self->currentMouseSerial = serial;
+            self->currentMouseTime = time;
+            const auto pressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
+            if (pressed)
+                self->grabSerial = serial;
+            const auto consumed = self->inputState->button (proxy, serial, time, button, state);
+            self->updateMouseModifiers (button, pressed);
+            if (self->inputState->hasKeyboardFocus())
+                self->keyRepeater.stopTimer();
+            if (consumed)
+                return;
+            if (pressed && self->pointerFocused)
+                self->inputState->releaseFocus();
             if (auto* window = self->pointerFocused)
             {
-                self->currentMouseSerial = serial;
-                self->currentMouseTime = time;
-                bool pressed = (state == WL_POINTER_BUTTON_STATE_PRESSED);
                 
                 // Subsurfaces don't get a configure callback, so we need to keep track of activation manually
                 if (pressed && window->parentWindow && ! window->isActivated)
@@ -1104,13 +1322,13 @@ void WaylandWindowSystem::setupGlobalInput()
                     window->peer->handleBroughtToFront();
                 }
                 
-                self->updateMouseModifiers (button, pressed);
                 self->handleMouseEvent (window);
             }
         },
-        .axis = [] (void* data, wl_pointer*, uint32 time, uint32 axis, wl_fixed_t value)
+        .axis = [] (void* data, wl_pointer* proxy, uint32 time, uint32 axis, wl_fixed_t value)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
+            self->inputState->pointerEvent (&wl_pointer_listener::axis, proxy, time, axis, value);
             if (auto* window = self->pointerFocused)
             {
                 self->currentMouseTime = time;
@@ -1127,10 +1345,18 @@ void WaylandWindowSystem::setupGlobalInput()
                 window->peer->handleMouseWheel (MouseInputSource::InputSourceType::mouse, localPos, time, wheel);
             }
         },
-        .frame = [] (void*, wl_pointer*) {},
-        .axis_source = [] (void*, wl_pointer*, uint32) {},
-        .axis_stop = [] (void*, wl_pointer*, uint32, uint32) {},
-        .axis_discrete = [] (void *, wl_pointer*, uint32, int32) {}
+        .frame = [] (void* data, wl_pointer* proxy) {
+            static_cast<WaylandWindowSystem*> (data)->inputState->pointerEvent (&wl_pointer_listener::frame, proxy);
+        },
+        .axis_source = [] (void* data, wl_pointer* proxy, uint32 source) {
+            static_cast<WaylandWindowSystem*> (data)->inputState->pointerEvent (&wl_pointer_listener::axis_source, proxy, source);
+        },
+        .axis_stop = [] (void* data, wl_pointer* proxy, uint32 time, uint32 axis) {
+            static_cast<WaylandWindowSystem*> (data)->inputState->pointerEvent (&wl_pointer_listener::axis_stop, proxy, time, axis);
+        },
+        .axis_discrete = [] (void* data, wl_pointer* proxy, uint32 axis, int32 discrete) {
+            static_cast<WaylandWindowSystem*> (data)->inputState->pointerEvent (&wl_pointer_listener::axis_discrete, proxy, axis, discrete);
+        }
     };
     
     // Touch setup
@@ -1154,6 +1380,7 @@ void WaylandWindowSystem::setupGlobalInput()
                 if (touchIndex == 0)
                 {
                     self->currentMouseSerial = serial;
+                    self->grabSerial = serial;
                     self->currentMousePosition = window->peer->localToGlobal (localPos);
                     self->lastFocusedWindow = (window->parentWindow || ! window->isVisible) ?
                                              self->lastFocusedWindow : window;
@@ -1223,24 +1450,90 @@ void WaylandWindowSystem::setupGlobalInput()
          .orientation = [] (void*, wl_touch*, int32, wl_fixed_t) {}
     };
        
-    if (hasTouch)
-    {
-       currentTouches = std::make_unique<MultiTouchMapper<int32>>();
-       globalTouch = WaylandSymbols::getInstance()->seatGetTouch (seat);
-       WaylandSymbols::getInstance()->touchAddListener (globalTouch, &touchListener, this);
-    }
-    
-    if (hasMouse)
-    {
-      globalPointer = WaylandSymbols::getInstance()->seatGetPointer (seat);
-      WaylandSymbols::getInstance()->pointerAddListener (globalPointer, &pointerListener, this);
-    }
-    
-    if (hasKeyboard)
-    {
-      globalKeyboard = WaylandSymbols::getInstance()->seatGetKeyboard (seat);
-      WaylandSymbols::getInstance()->keyboardAddListener (globalKeyboard, &keyboardListener, this);
-    }
+    const auto wantTouch = hasTouch;
+    const auto wantMouse = hasMouse;
+    const auto wantKeyboard = hasKeyboard;
+    const auto update = [this, wantTouch, wantMouse, wantKeyboard] {
+        auto* symbols = WaylandSymbols::getInstance();
+        WaylandInputState::updateProxy (globalTouch, wantTouch, [&] {
+            auto* proxy = symbols->seatGetTouch (seat);
+            if (proxy)
+            {
+                currentTouches = std::make_unique<MultiTouchMapper<int32>>();
+                symbols->touchAddListener (proxy, &touchListener, this);
+            }
+            return proxy;
+        }, [&] (wl_touch* proxy) {
+            std::vector<ComponentPeer*> peers;
+            for (const auto& entry : surfaceToWindow)
+                peers.push_back (entry.second->peer);
+            for (auto* peer : peers)
+            {
+                const auto indices = currentTouches->getAllTouchIndicesForPeer (peer);
+                for (auto index : indices)
+                    if (ComponentPeer::isValidPeer (peer))
+                        if (auto* window = getWaylandWindowForPeer (peer))
+                            handleTouchEvent (window, peer->globalToLocal (currentMousePosition), index, MouseEventFlags::upAndCancel);
+            }
+            currentTouches.reset();
+            if (symbols->proxyGetVersion (reinterpret_cast<wl_proxy*> (proxy)) >= WL_TOUCH_RELEASE_SINCE_VERSION)
+                symbols->touchRelease (proxy);
+            else
+                symbols->touchDestroy (proxy);
+        });
+
+        WaylandInputState::updateProxy (globalPointer, wantMouse, [&] {
+            auto* proxy = symbols->seatGetPointer (seat);
+            if (proxy)
+                symbols->pointerAddListener (proxy, &pointerListener, this);
+            return proxy;
+        }, [&] (wl_pointer* proxy) {
+            auto* window = std::exchange (pointerFocused, nullptr);
+            ModifierKeys::currentModifiers = ModifierKeys::currentModifiers.withoutMouseButtons();
+            currentMousePosition = MouseInputSource::offscreenMousePos;
+            if (window)
+                handleMouseEvent (window);
+            if (symbols->proxyGetVersion (reinterpret_cast<wl_proxy*> (proxy)) >= WL_POINTER_RELEASE_SINCE_VERSION)
+                symbols->pointerRelease (proxy);
+            else
+                symbols->pointerDestroy (proxy);
+        });
+
+        WaylandInputState::updateProxy (globalKeyboard, wantKeyboard, [&] {
+            auto* proxy = symbols->seatGetKeyboard (seat);
+            if (proxy)
+                symbols->keyboardAddListener (proxy, &keyboardListener, this);
+            return proxy;
+        }, [&] (wl_keyboard* proxy) {
+            auto* window = std::exchange (keyboardFocused, nullptr);
+            keyRepeater.stopTimer();
+            keysCurrentlyDown.clear();
+            if (xkbState)
+                symbols->xkbStateUnref (std::exchange (xkbState, nullptr));
+            if (keymap)
+                symbols->xkbKeymapUnref (std::exchange (keymap, nullptr));
+            ModifierKeys::currentModifiers = ModifierKeys::currentModifiers.withOnlyMouseButtons();
+            if (window)
+            {
+                auto* peer = window->peer;
+                peer->handleKeyUpOrDown (false);
+                if (ComponentPeer::isValidPeer (peer))
+                    peer->handleFocusLoss();
+            }
+            if (symbols->proxyGetVersion (reinterpret_cast<wl_proxy*> (proxy)) >= WL_KEYBOARD_RELEASE_SINCE_VERSION)
+                symbols->keyboardRelease (proxy);
+            else
+                symbols->keyboardDestroy (proxy);
+        });
+    };
+
+    const auto removeKeyboard = globalKeyboard && ! wantKeyboard;
+    const auto removePointer = globalPointer && ! wantMouse;
+    if (! inputState->replaceDevices (removeKeyboard, removePointer, update))
+        MessageManager::callAsync ([this] {
+            if (getInstanceWithoutCreating() == this)
+                setupGlobalInput();
+        });
 }
 
 void WaylandWindowSystem::setupDisplay (wl_output* output)
@@ -1337,19 +1630,19 @@ void WaylandWindowSystem::setupDataDeviceCallbacks()
         .data_offer = [] (void* data, wl_data_device*, wl_data_offer* offer)
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
-            self->currentOffer = offer;
-            self->isDraggingText = false;
-            self->isDraggingFiles = false;
+            self->offers.emplace (offer, OfferTypes{});
             
             static const wl_data_offer_listener offerListener =
             {
-                .offer = [] (void*, wl_data_offer*, const char* mimeType)
+                .offer = [] (void* context, wl_data_offer* offered, const char* mimeType)
                 {
-                    auto mime = String::fromUTF8 (mimeType);
-                    if (mime == "text/uri-list")
-                        getInstance()->isDraggingFiles = true;
-                    else if (mime == "text/plain" || mime == "text/plain;charset=utf-8")
-                        getInstance()->isDraggingText = true;
+                    auto& types = static_cast<WaylandWindowSystem*> (context)->offers[offered];
+                    const auto mime = String::fromUTF8 (mimeType);
+                    if (mime == "text/uri-list") types.files = true;
+                    if (mime == "text/plain;charset=utf-8"
+                        || (mime == "UTF8_STRING" && types.text != "text/plain;charset=utf-8")
+                        || (mime == "text/plain" && types.text.isEmpty()))
+                        types.text = mime;
                 },
                     .source_actions = [] (void*, wl_data_offer*, uint32) {},
                     .action = [] (void*, wl_data_offer*, uint32) {}
@@ -1362,23 +1655,26 @@ void WaylandWindowSystem::setupDataDeviceCallbacks()
         {
             auto* self = static_cast<WaylandWindowSystem*> (data);
             self->dragTargetWindow = self->findWindowBySurface (surface);
+            auto* previous = self->currentOffer;
             self->currentOffer = offer;
-            self->currentDragInfo = ComponentPeer::DragInfo{}; // Reset
+            self->releaseOffer (previous);
+            const auto found = self->offers.find (offer);
+            const auto types = found != self->offers.end() ? found->second : OfferTypes{};
+            self->currentDragInfo = ComponentPeer::DragInfo{};
             
             if (! self->dragTargetWindow || ! self->dragTargetWindow->peer)
                 return;
             
-            // Accept the offer first so we can read data
-            if (self->isDraggingFiles)
+            if (types.files)
             {
                 WaylandSymbols::getInstance()->dataOfferAccept (offer, serial, "text/uri-list");
                 WaylandSymbols::getInstance()->dataOfferSetActions (offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
                                                                     WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE,
                                                                     WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
                 
-                // Read file data immediately
-                self->readOfferData ("text/uri-list", [self, x, y] (const String& fileList)
+                self->readOfferData (offer, "text/uri-list", [self, offer, x, y] (const String& fileList)
                 {
+                    if (self->currentOffer != offer || ! self->dragTargetWindow || ! self->dragTargetWindow->peer) return;
                     self->currentDragInfo.files.clear();
                     auto lines = StringArray::fromLines (fileList);
                     for (const auto& line : lines)
@@ -1391,15 +1687,15 @@ void WaylandWindowSystem::setupDataDeviceCallbacks()
                     self->dragTargetWindow->peer->handleDragMove (self->currentDragInfo);
                 });
             }
-            else if (self->isDraggingText)
+            else if (types.text.isNotEmpty())
             {
-                WaylandSymbols::getInstance()->dataOfferAccept (offer, serial, "text/plain");
+                WaylandSymbols::getInstance()->dataOfferAccept (offer, serial, types.text.toRawUTF8());
                 WaylandSymbols::getInstance()->dataOfferSetActions (offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
                                                                     WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
                 
-                // Read text data immediately
-                self->readOfferData ("text/plain", [self, x, y] (const String& textData)
+                self->readOfferData (offer, types.text, [self, offer, x, y] (const String& textData)
                 {
+                    if (self->currentOffer != offer || ! self->dragTargetWindow || ! self->dragTargetWindow->peer) return;
                     self->currentDragInfo.text = textData;
                     self->currentDragInfo.position = WaylandSymbols::getInstance()->fixedToPoint<int>(x, y);
                     self->dragTargetWindow->peer->handleDragMove (self->currentDragInfo);
@@ -1412,7 +1708,9 @@ void WaylandWindowSystem::setupDataDeviceCallbacks()
             if (self->dragTargetWindow && self->dragTargetWindow->peer)
                 self->dragTargetWindow->peer->handleDragExit (self->currentDragInfo);
             self->dragTargetWindow = nullptr;
+            auto* previous = self->currentOffer;
             self->currentOffer = nullptr;
+            self->releaseOffer (previous);
         },
         .motion = [] (void* data, wl_data_device*, uint32, wl_fixed_t x, wl_fixed_t y)
         {
@@ -1428,21 +1726,25 @@ void WaylandWindowSystem::setupDataDeviceCallbacks()
             if (! self->dragTargetWindow || ! self->dragTargetWindow->peer || ! self->currentOffer)
                 return;
             
-            if (self->dragTargetWindow->peer->handleDragDrop (self->currentDragInfo))
-                WaylandSymbols::getInstance()->dataOfferFinish (self->currentOffer);
+            auto* dropped = self->currentOffer;
+            if (self->dragTargetWindow->peer->handleDragDrop (self->currentDragInfo) && self->currentOffer == dropped)
+                WaylandSymbols::getInstance()->dataOfferFinish (dropped);
         },
         .selection = [] (void* data, wl_data_device*, wl_data_offer* offer)
         {
             auto* self = static_cast<WaylandWindowSystem*>(data);
-            auto callback = [] (const String& newClipboardText)
+            auto* previous = self->clipboardOffer;
+            self->clipboardOffer = offer;
+            const auto generation = ++self->clipboardGeneration;
+            self->currentClipboardText.clear();
+            self->releaseOffer (previous);
+            const auto found = self->offers.find (offer);
+            if (found == self->offers.end() || found->second.text.isEmpty()) return;
+            self->readOfferData (offer, found->second.text, [self, generation] (const String& text)
             {
-                getInstance()->currentClipboardText = newClipboardText;
-            };
-            
-            self->currentOffer = offer;
-            self->readOfferData ("UTF8_STRING", callback);
-            self->readOfferData ("text/plain", callback);
-            self->readOfferData ("text/plain;charset=utf-8", callback);
+                if (generation == self->clipboardGeneration)
+                    self->currentClipboardText = text;
+            });
         }
     };
     
@@ -1454,7 +1756,7 @@ void WaylandWindowSystem::handleMouseEvent (WaylandWindow* window)
     auto localPos = window->peer->globalToLocal (currentMousePosition);
     window->peer->handleMouseEvent (MouseInputSource::InputSourceType::mouse,
                                     localPos,
-                                    ModifierKeys::currentModifiers,
+                                    inputState->hostMouseModifiers (ModifierKeys::currentModifiers),
                                     MouseInputSource::defaultPressure,  // Default pressure
                                     MouseInputSource::defaultOrientation, // Default orientation
                                     currentMouseTime);
@@ -1517,8 +1819,11 @@ void WaylandWindowSystem::handleTouchEvent (WaylandWindow* window, Point<float> 
     }
 }
 
-void WaylandWindowSystem::handleKeyEvent (WaylandWindow* window, uint32 waylandKey, bool pressed)
+void WaylandWindowSystem::handleKeyEvent (WaylandWindow* window, uint32 waylandKey, bool pressed, bool dispatchToWidgets)
 {
+    if (! xkbState)
+        return;
+
     auto xkbKeyCode = static_cast<xkb_keycode_t>(waylandKey + 8);
     xkb_keysym_t keysym = WaylandSymbols::getInstance()->xkbStateKeyGetOneSym (xkbState, xkbKeyCode);
     
@@ -1614,9 +1919,12 @@ void WaylandWindowSystem::handleKeyEvent (WaylandWindow* window, uint32 waylandK
     
     if (pressed)
     {
-        lastKey = {juceKeyCode, textChar};
         keysCurrentlyDown.insert (juceKeyCode);
-        keyRepeater.startTimer (keyRepeatDelay);
+        if (dispatchToWidgets && window && keyRepeatRate > 0)
+        {
+            lastKey = {juceKeyCode, textChar};
+            keyRepeater.startTimer (keyRepeatDelay);
+        }
     }
     else
     {
@@ -1625,6 +1933,9 @@ void WaylandWindowSystem::handleKeyEvent (WaylandWindow* window, uint32 waylandK
             keyRepeater.stopTimer();
     }
     
+    if (! dispatchToWidgets || ! window)
+        return;
+
     if (oldMods != ModifierKeys::currentModifiers)
         window->peer->handleModifierKeysChange();
     
@@ -1636,6 +1947,11 @@ void WaylandWindowSystem::handleKeyEvent (WaylandWindow* window, uint32 waylandK
 
 void WaylandWindowSystem::handleKeyRepeat()
 {
+    if (inputState->hasKeyboardFocus())
+    {
+        keyRepeater.stopTimer();
+        return;
+    }
     if (keyboardFocused)
     {
         if (isKeyCurrentlyDown (lastKey.first))
@@ -1652,17 +1968,44 @@ void WaylandWindowSystem::handleKeyRepeat()
 
 void WaylandWindowSystem::commit (WaylandWindow* window)
 {
-    if (window->currentBuffer)
-        WaylandSymbols::getInstance()->surfaceAttach (window->surface, window->currentBuffer->buffer, 0, 0);
-    
-    WaylandSymbols::getInstance()->surfaceCommit (window->surface);
-    
-    // Request the next frame callback after committing
+    if (! window->isVisible || (! window->parentWindow && ! window->configured)
+        || ! window->currentBuffer
+        || window->currentBuffer->width != window->bounds.getWidth() * window->bufferScale
+        || window->currentBuffer->height != window->bounds.getHeight() * window->bufferScale)
+        return;
+
+    if (! window->parentWindow)
+    {
+        auto* state = WaylandSymbols::getInstance()->decorStateNew (window->bounds.getWidth(), window->bounds.getHeight());
+        WaylandSymbols::getInstance()->decorFrameCommit (window->handle.frame, state, nullptr);
+        WaylandSymbols::getInstance()->decorStateFree (state);
+    }
+    updateRegions (window);
+    WaylandSymbols::getInstance()->surfaceAttach (window->surface, window->currentBuffer->buffer, 0, 0);
     requestFrame (window);
-    
-    // Commit parent surface if this is a subsurface
+    WaylandSymbols::getInstance()->surfaceCommit (window->surface);
+    window->contentMapped = true;
     if (window->parentWindow)
-        WaylandSymbols::getInstance()->surfaceCommit (window->parentWindow->surface);
+        commitEmbeddedChildren (window->parentWindow->surface);
+}
+
+bool WaylandWindowSystem::isSurfaceMapped (wl_surface* surface) const
+{
+    const auto found = surfaceToWindow.find (surface);
+    return found != surfaceToWindow.end() && found->second->isVisible && found->second->contentMapped;
+}
+
+bool WaylandWindowSystem::commitEmbeddedChildren (wl_surface* surface)
+{
+    auto* window = findWindowBySurface (surface);
+    if (! window)
+        return false;
+    if (window->isVisible && (window->parentWindow || window->configured) && window->contentMapped
+        && window->currentBuffer
+        && window->currentBuffer->width == window->bounds.getWidth() * window->bufferScale
+        && window->currentBuffer->height == window->bounds.getHeight() * window->bufferScale)
+        WaylandSymbols::getInstance()->surfaceCommit (surface);
+    return true;
 }
 
 // Add this method to get display information
@@ -1774,7 +2117,10 @@ void WaylandWindowSystem::updateCursor()
         cursorSurface = WaylandSymbols::getInstance()->compositorCreateSurface (compositor);
         currentCursor = createStandardMouseCursor (MouseCursor::NormalCursor);
     }
-    
+
+    if (! globalPointer)
+        return;
+
     if (currentCursor.standardCursor == -1)
     {
         auto& image = currentCursor.cursorImage;
@@ -1896,73 +2242,67 @@ void WaylandWindowSystem::showCursor (WaylandCursor cursorHandle)
     updateCursor();
 }
 
-void WaylandWindowSystem::readOfferData (const String& mimeType, std::function<void (const String&)> callback) const
+void WaylandWindowSystem::releaseOffer (wl_data_offer* offer)
+{
+    if (offer && offer != currentOffer && offer != clipboardOffer && offers.erase (offer) != 0)
+        WaylandSymbols::getInstance()->dataOfferDestroy (offer);
+}
+
+void WaylandWindowSystem::readOfferData (wl_data_offer* offer, const String& mimeType,
+                                       std::function<void (const String&)> callback)
 {
     int pipeFds[2];
-    if (! currentOffer || pipe (pipeFds) == -1)
-        return;
-    
-    WaylandSymbols::getInstance()->dataOfferReceive (currentOffer, mimeType.toRawUTF8(), pipeFds[1]);
+    if (! offer || pipe2 (pipeFds, O_CLOEXEC) != 0) return;
+    WaylandPipeTransfer transfer (pipeFds[0]);
+    const ScopedValueSetter<WaylandPipeTransfer*> active (activeTransfer, &transfer);
+    WaylandSymbols::getInstance()->dataOfferReceive (offer, mimeType.toRawUTF8(), pipeFds[1]);
     close (pipeFds[1]);
-    
-    WaylandSymbols::getInstance()->displayRoundtrip (display);
-    
-    // Wait for data to become available
-    fd_set fds;
-    FD_ZERO (&fds);
-    FD_SET (pipeFds[0], &fds);
-    struct timeval timeout;
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-    
-    int ret = select (pipeFds[0] + 1, &fds, nullptr, nullptr, &timeout);
-    String data;
-    if (ret > 0 && FD_ISSET (pipeFds[0], &fds))
-    {
-        char buffer[4096];
-        ssize_t bytesRead;
-        
-        // Set non-blocking
-        int flags = fcntl (pipeFds[0], F_GETFL, 0);
-        fcntl (pipeFds[0], F_SETFL, flags | O_NONBLOCK);
-        
-        while ((bytesRead = read (pipeFds[0], buffer, sizeof (buffer))) > 0)
-            data += String::createStringFromData (buffer, static_cast<int>(bytesRead));
-    }
-    
-    close (pipeFds[0]);
-    callback (data);
+    if (WaylandSymbols::getInstance()->displayRoundtrip (display) < 0 || ! transfer.receive()) return;
+    callback (transfer.bytes.empty() ? String() : String::fromUTF8 (transfer.bytes.data(), (int) transfer.bytes.size()));
 }
 
 void WaylandWindowSystem::copyTextToClipboard (const String& text)
 {
-    if (! dataDeviceManager || text.isEmpty())
-        return;
-    
+    if (! dataDeviceManager || ! dataDevice) return;
+    auto* replacement = WaylandSymbols::getInstance()->dataDeviceManagerCreateDataSource (dataDeviceManager);
+    if (! replacement) return;
+    if (clipboardSource) WaylandSymbols::getInstance()->dataSourceDestroy (clipboardSource);
+    clipboardSource = replacement;
+    publishedClipboardText = text;
     currentClipboardText = text;
-    
-    clipboardSource = WaylandSymbols::getInstance()->dataDeviceManagerCreateDataSource (dataDeviceManager);
-    
+    ++clipboardGeneration;
+
     WaylandSymbols::getInstance()->dataSourceOffer (clipboardSource, "text/plain");
     WaylandSymbols::getInstance()->dataSourceOffer (clipboardSource, "text/plain;charset=utf-8");
     WaylandSymbols::getInstance()->dataSourceOffer (clipboardSource, "UTF8_STRING");
-    
+
     static const wl_data_source_listener clipboardSourceListener = {
-            .target = [] (void*, wl_data_source*, const char*) {},
-            .send = [] (void* data, wl_data_source* source, const char*, int32 fd)
+        .target = [] (void*, wl_data_source*, const char*) {},
+        .send = [] (void* data, wl_data_source* source, const char* mime, int32 fd)
+        {
+            auto* self = static_cast<WaylandWindowSystem*> (data);
+            const auto type = String::fromUTF8 (mime);
+            if (source == self->clipboardSource
+                && (type == "text/plain" || type == "text/plain;charset=utf-8" || type == "UTF8_STRING"))
+                self->writeDataToFd (fd, self->publishedClipboardText);
+            else
+                close (fd);
+        },
+        .cancelled = [] (void* data, wl_data_source* source)
+        {
+            auto* self = static_cast<WaylandWindowSystem*> (data);
+            if (source == self->clipboardSource)
             {
-                auto* self = static_cast<WaylandWindowSystem*> (data);
-                if (source == self->clipboardSource)
-                {
-                    self->writeDataToFd (fd, self->currentClipboardText);
-                }
-            },
-            .cancelled = [] (void*, wl_data_source*) {},
-            .dnd_drop_performed = [] (void*, wl_data_source*) {},
-            .dnd_finished = [] (void*, wl_data_source*) {},
-            .action = [] (void*, wl_data_source*, uint32) {}
+                self->clipboardSource = nullptr;
+                self->publishedClipboardText.clear();
+                WaylandSymbols::getInstance()->dataSourceDestroy (source);
+            }
+        },
+        .dnd_drop_performed = [] (void*, wl_data_source*) {},
+        .dnd_finished = [] (void*, wl_data_source*) {},
+        .action = [] (void*, wl_data_source*, uint32) {}
     };
-    
+
     WaylandSymbols::getInstance()->dataSourceAddListener (clipboardSource, &clipboardSourceListener, this);
     WaylandSymbols::getInstance()->dataDeviceSetSelection (dataDevice, clipboardSource, currentMouseSerial);
 }
@@ -2007,18 +2347,20 @@ void WaylandWindowSystem::setupDragSource (WaylandWindow* window, bool isText, b
                     auto mime = String::fromUTF8 (mimeType);
                     if (mime == "text/uri-list" && ! self->dragFiles.isEmpty())
                     {
-                        // Convert file paths to URI list
                         StringArray uris;
                         for (const auto& file : self->dragFiles)
                             uris.add ("file://" + file);
 
                         self->writeDataToFd (fd, uris.joinIntoString ("\r\n") + "\r\n");
+                        return;
                     }
                     else if (mime.startsWith ("text/"))
                     {
                         self->writeDataToFd (fd, self->dragText);
+                        return;
                     }
                 }
+                close (fd);
             },
             .cancelled = [] (void* data, wl_data_source* source)
             {
@@ -2073,28 +2415,13 @@ void WaylandWindowSystem::setupDragSource (WaylandWindow* window, bool isText, b
     }
     
     WaylandSymbols::getInstance()->dataSourceAddListener (dragSource, &dragSourceListener, this);
-    WaylandSymbols::getInstance()->dataDeviceStartDrag (dataDevice, dragSource, window->surface, nullptr, currentMouseSerial);
+    WaylandSymbols::getInstance()->dataDeviceStartDrag (dataDevice, dragSource, window->surface, nullptr, grabSerial);
 }
 
 void WaylandWindowSystem::writeDataToFd (int fd, const String& data) const
 {
-    auto utf8 = data.toUTF8();
-    int64 written = 0;
-    int64 total = (int64)utf8.sizeInBytes() - 1; // Exclude null terminator
-    
-    while (written < static_cast<ssize_t> (total))
-    {
-        ssize_t result = write (fd, utf8.getAddress() + written, (uint64)(total - written));
-        if (result < 0)
-        {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                continue;
-            break;
-        }
-        written += result;
-    }
-    
-    close (fd);
+    const auto utf8 = data.toUTF8();
+    WaylandPipeTransfer::send (fd, utf8.getAddress(), utf8.sizeInBytes() - 1, activeTransfer);
 }
 
 bool WaylandWindowSystem::isKeyCurrentlyDown (int keyCode)
@@ -2130,3 +2457,8 @@ void processWaylandFd()
 }
 
 } // namespace juce
+
+#if JUCE_UNIT_TESTS
+ #include "juce_WaylandInput_test.cpp"
+ #include "juce_WaylandClipboard_test.cpp"
+#endif

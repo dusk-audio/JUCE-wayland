@@ -227,6 +227,10 @@ public:
                                          (wl_display*),
                                          wl_registry*)
 
+    JUCE_DECLARE_INLINE_FUNCTION (wl_display_sync, displaySync,
+                                         (wl_display*),
+                                         wl_callback*)
+
     // wl_registry
     JUCE_DECLARE_INLINE_FUNCTION (wl_registry_add_listener, registryAddListener,
                                          (wl_registry*, const wl_registry_listener*, void*),
@@ -348,6 +352,8 @@ public:
                                          (wl_keyboard*),
                                          void)
     JUCE_DECLARE_INLINE_FUNCTION(wl_touch_add_listener, touchAddListener, (wl_touch*, const wl_touch_listener*, void*), int)
+    JUCE_DECLARE_INLINE_FUNCTION (wl_touch_release, touchRelease, (wl_touch*), void)
+    JUCE_DECLARE_INLINE_FUNCTION (wl_touch_destroy, touchDestroy, (wl_touch*), void)
 
     // wl_data_device_manager
     JUCE_DECLARE_INLINE_FUNCTION (wl_data_device_manager_create_data_source, dataDeviceManagerCreateDataSource,
@@ -378,6 +384,9 @@ public:
                                          void)
     
     // wl_data_source
+    JUCE_DECLARE_INLINE_FUNCTION (wl_data_source_destroy, dataSourceDestroy,
+                                         (wl_data_source*),
+                                         void)
     JUCE_DECLARE_INLINE_FUNCTION (wl_data_source_offer, dataSourceOffer,
                                          (wl_data_source*, const char*),
                                          void)

@@ -34,6 +34,14 @@ juce_add_console_app(UnitTestRunner)
 
 juce_generate_juce_header(UnitTestRunner)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    option(JUCE_UNIT_TESTS_WAYLAND "Include native Wayland tests" OFF)
+    if(JUCE_UNIT_TESTS_WAYLAND)
+        target_compile_definitions(UnitTestRunner PRIVATE JUCE_WAYLAND=1)
+        target_link_libraries(UnitTestRunner PRIVATE juce::pkgconfig_JUCE_WAYLAND_LINUX_DEPS)
+    endif()
+endif()
+
 target_sources(UnitTestRunner PRIVATE Source/Main.cpp)
 
 target_compile_definitions(UnitTestRunner PRIVATE

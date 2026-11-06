@@ -1,0 +1,57 @@
+name: Dusk Wayland tests
+
+on:
+  push:
+    branches:
+      - dusk-wayland
+      - fix/**
+  pull_request:
+    branches:
+      - dusk-wayland
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dusk-wayland-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wayland-unit-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libfreetype-dev libfontconfig1-dev \
+            libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxi-dev \
+            libxinerama-dev libxrandr-dev libxrender-dev \
+            libglu1-mesa-dev mesa-common-dev libegl-dev \
+            libwayland-dev libxkbcommon-dev libdecor-0-dev
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DJUCE_BUILD_EXTRAS=ON -DJUCE_UNIT_TESTS_WAYLAND=ON
+
+      - name: Build UnitTestRunner
+        run: cmake --build build --target UnitTestRunner -j4
+
+      # The suites drive the input state and pipe transfer directly and never
+      # connect to a compositor.
+      - name: Run Wayland suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner=build/extras/UnitTestRunner/UnitTestRunner_artefacts/Debug/UnitTestRunner
+          for suite in WaylandInput WaylandClipboard; do
+            timeout 300 "$runner" --name="$suite" 2>&1 | tee "$suite.log"
+            if ! grep -q "^Completed tests in $suite / " "$suite.log"; then
+              echo "::error::$suite ran no tests"
+              exit 1
+            fi
+          done
