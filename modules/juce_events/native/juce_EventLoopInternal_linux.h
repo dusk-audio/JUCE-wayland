@@ -62,6 +62,14 @@ struct LinuxEventLoopInternal
     static void invokeEventLoopCallbackForFd (int);
     /** @internal */
     static std::vector<int> getRegisteredFds();
+
+    /** @internal
+
+        Sets the one function the message loop calls on its own thread just before it
+        blocks waiting for an event, or clears it with an empty function. The X11
+        windowing flushes its display there.
+    */
+    static void setBeforeSleepCallback (std::function<void()>);
 };
 
 } // namespace juce

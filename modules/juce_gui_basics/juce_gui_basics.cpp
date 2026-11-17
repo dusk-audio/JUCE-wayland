@@ -230,6 +230,7 @@
 #if JUCE_WAYLAND
  #include "native/juce_WaylandSymbols.cpp"
 #endif
+ #include <juce_events/native/juce_EventLoopInternal_linux.h>
  #include "native/juce_XSymbols_linux.cpp"
  #include "native/juce_DragAndDrop_linux.cpp"
 

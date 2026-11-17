@@ -213,8 +213,20 @@ public:
             (*callback)();
     }
 
+    void setBeforeSleepCallback (std::function<void()> callback)
+    {
+        const ScopedLock sl (lock);
+        beforeSleep = callback ? std::make_shared<std::function<void()>> (std::move (callback)) : nullptr;
+    }
+
     bool sleepUntilNextEvent (int timeoutMs)
-    {   
+    {
+        // Called without the lock, so it may take whatever lock it needs. Only before a
+        // wait that can block: the zero-timeout poll below runs under the lock.
+        if (timeoutMs != 0)
+            if (const auto callback = [this] { const ScopedLock sl (lock); return beforeSleep; }())
+                (*callback)();
+
         const ScopedLock sl (lock);
 #if JUCE_WAYLAND
         WaylandMessageLoop::prepareWaylandFd(); // Wayland needs to do work before and after polling!
@@ -288,6 +300,7 @@ private:
     CriticalSection lock;
 
     std::map<int, SharedCallback> callbacks;
+    SharedCallback beforeSleep;
     std::vector<SharedCallback> callbackStorage;
     std::vector<pollfd> pfds;
 
@@ -399,6 +412,12 @@ void LinuxEventLoopInternal::deregisterLinuxEventLoopListener (LinuxEventLoopInt
 {
     if (auto* runLoop = InternalRunLoop::getInstanceWithoutCreating())
         runLoop->removeListener (listener);
+}
+
+void LinuxEventLoopInternal::setBeforeSleepCallback (std::function<void()> callback)
+{
+    if (auto* runLoop = InternalRunLoop::getInstanceWithoutCreating())
+        runLoop->setBeforeSleepCallback (std::move (callback));
 }
 
 void LinuxEventLoopInternal::invokeEventLoopCallbackForFd (int fd)

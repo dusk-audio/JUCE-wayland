@@ -3387,6 +3387,18 @@ bool XWindowSystem::initialiseXDisplay()
                                             } while (display != nullptr);
                                         });
 
+    // A request made outside event handling, from a timer or an async callback, sits in
+    // Xlib's buffer until something flushes it. An idle app runs no timer that would, so
+    // the message loop flushes the display each time before it sleeps.
+    LinuxEventLoopInternal::setBeforeSleepCallback ([this]
+    {
+        if (display == nullptr)
+            return;
+
+        XWindowSystemUtilities::ScopedXLock xLock;
+        X11Symbols::getInstance()->xFlush (display);
+    });
+
     return true;
 }
 
@@ -3453,6 +3465,7 @@ void XWindowSystem::destroyXDisplay()
             X11Symbols::getInstance()->xSync (display, True);
         }
 
+        LinuxEventLoopInternal::setBeforeSleepCallback ({});
         LinuxEventLoop::unregisterFdCallback (X11Symbols::getInstance()->xConnectionNumber (display));
 
         {
