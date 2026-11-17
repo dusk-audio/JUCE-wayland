@@ -645,7 +645,11 @@ private:
                     if (allowResize)
                         configureNotify();
                     else
-                        MessageManager::callAsync ([this] {componentMovedOrResized (owner, true, true);});
+                        MessageManager::callAsync ([safeOwner = Component::SafePointer<XEmbedComponent> { &owner }]
+                        {
+                            if (safeOwner != nullptr)
+                                safeOwner->pimpl->componentMovedOrResized (*safeOwner, true, true);
+                        });
 
                     return true;
 
