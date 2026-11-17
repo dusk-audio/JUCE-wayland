@@ -243,6 +243,7 @@ struct WaylandWindow {
     bool configureRequested = false;
     bool configured = false;
     bool contentMapped = false;
+    bool geometryPending = false;
     bool isFullscreen:1 = false;
     bool isMinimised:1 = false;
     bool isActivated:1 = false;
@@ -515,6 +516,7 @@ WaylandWindow* WaylandWindowSystem::createWindow (bool isSubsurface, ComponentPe
                 WaylandSymbols::getInstance()->decorFrameCommit (frame, state, configuration);
                 WaylandSymbols::getInstance()->decorStateFree (state);
                 w->configured = true;
+                w->geometryPending = true;
 
                 // Resizing or focus callbacks may destroy the peer or submit a frame.
                 configuredPeer->setBounds (Rectangle<int> (0, 0, width, height), w->isFullscreen);
@@ -914,9 +916,15 @@ void WaylandWindowSystem::setVisible (WaylandWindow* window, bool shouldBeVisibl
     if (! window->contentMapped)
         return;
 
+    // A configure handled since the last commit leaves its window geometry pending. The null-buffer
+    // commit would apply it to an empty surface, which xdg-shell forbids, so apply it to the buffer
+    // still attached first.
+    if (window->geometryPending)
+        WaylandSymbols::getInstance()->surfaceCommit (window->surface);
     WaylandSymbols::getInstance()->surfaceAttach (window->surface, nullptr, 0, 0);
     WaylandSymbols::getInstance()->surfaceCommit (window->surface);
     window->contentMapped = false;
+    window->geometryPending = false;
     if (window->parentWindow)
     {
         commitEmbeddedChildren (window->parentWindow->surface);
@@ -1985,6 +1993,7 @@ void WaylandWindowSystem::commit (WaylandWindow* window)
     requestFrame (window);
     WaylandSymbols::getInstance()->surfaceCommit (window->surface);
     window->contentMapped = true;
+    window->geometryPending = false;
     if (window->parentWindow)
         commitEmbeddedChildren (window->parentWindow->surface);
 }
@@ -2004,7 +2013,10 @@ bool WaylandWindowSystem::commitEmbeddedChildren (wl_surface* surface)
         && window->currentBuffer
         && window->currentBuffer->width == window->bounds.getWidth() * window->bufferScale
         && window->currentBuffer->height == window->bounds.getHeight() * window->bufferScale)
+    {
         WaylandSymbols::getInstance()->surfaceCommit (surface);
+        window->geometryPending = false;
+    }
     return true;
 }
 
