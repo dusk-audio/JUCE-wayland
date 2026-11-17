@@ -325,8 +325,16 @@ public:
     //==============================================================================
     void repaint (const Rectangle<int>& area) override
     {
-        if (repainter != nullptr)
-            repainter->repaint (area.getIntersection (bounds.withZeroOrigin()));
+        if (repainter == nullptr)
+            return;
+
+        const auto clipped = area.getIntersection (bounds.withZeroOrigin());
+
+        if (clipped.isEmpty())
+            return;
+
+        repainter->repaint (clipped);
+        vBlankPacer.repaintRequested();
     }
 
     void performAnyPendingRepaintsNow() override
@@ -503,9 +511,9 @@ private:
 
             if (! regionsNeedingRepaint.isEmpty())
                 performAnyPendingRepaintsNow();
-            else if (Time::getApproximateMillisecondCounter() > lastTimeImageUsed + 3000)
-                image = Image();
         }
+
+        bool hasPendingRegions() const noexcept    { return ! regionsNeedingRepaint.isEmpty(); }
 
         void repaint (Rectangle<int> area)
         {
@@ -566,17 +574,35 @@ private:
 
                 for (auto& i : originalRepaintRegion)
                    XWindowSystem::getInstance()->blitToWindow (peer.windowH, image, i, totalArea);
+
+                // With the vblank timer at rest after this frame, nothing else may touch the
+                // connection, so the frame would wait in Xlib's output buffer.
+                XWindowSystemUtilities::ScopedXLock xLock;
+                X11Symbols::getInstance()->xFlush (XWindowSystem::getInstance()->getDisplay());
             }
 
             lastTimeImageUsed = Time::getApproximateMillisecondCounter();
+
+            if (! image.isNull() && ! imageReleaser.isTimerRunning())
+                imageReleaser.startTimer (3000);
         }
 
     private:
+        void releaseUnusedImage()
+        {
+            if (Time::getApproximateMillisecondCounter() <= lastTimeImageUsed + 3000)
+                return;
+
+            image = Image();
+            imageReleaser.stopTimer();
+        }
+
         LinuxComponentPeer& peer;
         const bool isSemiTransparentWindow;
         Image image;
         uint32 lastTimeImageUsed = 0;
         RectangleList<int> regionsNeedingRepaint;
+        TimedCallback imageReleaser { [this] { releaseUnusedImage(); } };
 
         bool useARGBImagesForRendering = XWindowSystem::getInstance()->canUseARGBImages();
 
@@ -643,14 +669,23 @@ private:
             const auto newIntFrequencyHz = roundToInt (display->verticalFrequencyHz.value_or (0.0));
             const auto frequencyToUse = newIntFrequencyHz != 0 ? newIntFrequencyHz : 100;
 
-            if (vBlankManager.getTimerInterval() != frequencyToUse)
-                vBlankManager.startTimerHz (frequencyToUse);
+            vBlankPacer.setFrequencyHz (frequencyToUse);
         }
+    }
+
+    bool needsVBlankTicks() const
+    {
+        return ! vBlankListeners.isEmpty() || (repainter != nullptr && repainter->hasPendingRegions());
+    }
+
+    void vBlankListenerAdded() override
+    {
+        vBlankPacer.listenerAdded();
     }
 
     //==============================================================================
     std::unique_ptr<LinuxRepaintManager> repainter;
-    TimedCallback vBlankManager { [this]() { onVBlank(); } };
+    LinuxVBlankPacer vBlankPacer { [this] { onVBlank(); }, [this] { return needsVBlankTicks(); } };
 
     ::Window windowH = {}, parentWindow = {};
     Rectangle<int> bounds;

@@ -7,7 +7,7 @@ namespace juce
 {
 
 //==============================================================================
-class WaylandComponentPeer final : public ComponentPeer, public Timer
+class WaylandComponentPeer final : public ComponentPeer
 {
     public:
     WaylandComponentPeer (Component& comp, int windowStyleFlags, WaylandWindow* parentToAddTo)
@@ -66,9 +66,7 @@ class WaylandComponentPeer final : public ComponentPeer, public Timer
     
     void onFrame()
     {
-        timerCallback();
-        // We only get wayland sync requests when we actually repaint, so use a timer from this point on to keep sending vblanks
-        startTimer (getTimerInterval());
+        vBlankPacer.frameArrived();
     }
     
     void handleScreenSizeChange() override
@@ -242,8 +240,16 @@ class WaylandComponentPeer final : public ComponentPeer, public Timer
     //==============================================================================
     void repaint (const Rectangle<int>& area) override
     {
-        if (repainter != nullptr)
-            repainter->repaint (area.getIntersection (bounds.withZeroOrigin()));
+        if (repainter == nullptr)
+            return;
+
+        const auto clipped = area.getIntersection (bounds.withZeroOrigin());
+
+        if (clipped.isEmpty())
+            return;
+
+        repainter->repaint (clipped);
+        vBlankPacer.repaintRequested();
     }
     
     void performAnyPendingRepaintsNow() override
@@ -329,9 +335,9 @@ class WaylandComponentPeer final : public ComponentPeer, public Timer
         {
             if (! regionsNeedingRepaint.isEmpty())
                 performAnyPendingRepaintsNow();
-            else if (Time::getApproximateMillisecondCounter() > lastTimeImageUsed + 3000)
-                image = Image();
         }
+
+        bool hasPendingRegions() const noexcept    { return ! regionsNeedingRepaint.isEmpty(); }
         
         void repaint (Rectangle<int> area)
         {
@@ -377,13 +383,26 @@ class WaylandComponentPeer final : public ComponentPeer, public Timer
             }
             
             lastTimeImageUsed = Time::getApproximateMillisecondCounter();
+
+            if (! image.isNull() && ! imageReleaser.isTimerRunning())
+                imageReleaser.startTimer (3000);
         }
         
         private:
+        void releaseUnusedImage()
+        {
+            if (Time::getApproximateMillisecondCounter() <= lastTimeImageUsed + 3000)
+                return;
+
+            image = Image();
+            imageReleaser.stopTimer();
+        }
+
         WaylandComponentPeer& peer;
         Image image;
         uint32 lastTimeImageUsed = 0;
         RectangleList<int> regionsNeedingRepaint;
+        TimedCallback imageReleaser { [this] { releaseUnusedImage(); } };
         
         bool useARGBImagesForRendering = true;
         JUCE_DECLARE_NON_COPYABLE (WaylandRepaintManager)
@@ -402,7 +421,7 @@ class WaylandComponentPeer final : public ComponentPeer, public Timer
         return screenPosition - t.getScreenPosition().toFloat();
     }
 
-    void timerCallback() override
+    void onVBlank()
     {
         const auto timestampSec = Time::getMillisecondCounterHiRes() / 1000.0;
         callVBlankListeners (timestampSec);
@@ -420,18 +439,28 @@ class WaylandComponentPeer final : public ComponentPeer, public Timer
             const auto newIntFrequencyHz = roundToInt (display->verticalFrequencyHz.value_or (0.0));
             const auto frequencyToUse = newIntFrequencyHz != 0 ? newIntFrequencyHz : 100;
             
-            if (getTimerInterval() != frequencyToUse)
-                startTimerHz (frequencyToUse);
+            vBlankPacer.setFrequencyHz (frequencyToUse);
         }
         else {
-            startTimerHz (60);
+            vBlankPacer.setFrequencyHz (60);
         }
+    }
+
+    bool needsVBlankTicks() const
+    {
+        return ! vBlankListeners.isEmpty() || (repainter != nullptr && repainter->hasPendingRegions());
+    }
+
+    void vBlankListenerAdded() override
+    {
+        vBlankPacer.listenerAdded();
     }
     
     //==============================================================================
     WaylandWindow* windowH = nullptr;
     WaylandWindow* parentWindow = nullptr;
     std::unique_ptr<WaylandRepaintManager> repainter;
+    LinuxVBlankPacer vBlankPacer { [this] { onVBlank(); }, [this] { return needsVBlankTicks(); } };
     Rectangle<int> bounds;
     bool isAlwaysOnTop = false;
     double currentScaleFactor = 1.0;

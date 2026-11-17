@@ -50,7 +50,18 @@ TooltipWindow::TooltipWindow (Component* parentComp, int delayMs)
 
     if (desktop.getMainMouseSource().canHover())
     {
-        desktop.addGlobalMouseListener (this);
+        // A global mouse listener keeps the Desktop's mouse poll running; a tip that lives
+        // inside a parent only needs that parent's events.
+        if (parentComp != nullptr)
+        {
+            mouseEventSource = parentComp;
+            parentComp->addMouseListener (this, true);
+        }
+        else
+        {
+            desktop.addGlobalMouseListener (this);
+        }
+
         startTimer (123);
     }
 }
@@ -58,7 +69,11 @@ TooltipWindow::TooltipWindow (Component* parentComp, int delayMs)
 TooltipWindow::~TooltipWindow()
 {
     hideTip();
-    Desktop::getInstance().removeGlobalMouseListener (this);
+
+    if (mouseEventSource != nullptr)
+        mouseEventSource->removeMouseListener (this);
+    else
+        Desktop::getInstance().removeGlobalMouseListener (this);
 }
 
 void TooltipWindow::setMillisecondsBeforeTipAppears (const int newTimeMs) noexcept
@@ -75,18 +90,45 @@ void TooltipWindow::mouseEnter (const MouseEvent& e)
 {
     if (e.eventComponent == this)
         hideTip();
+
+    startPolling();
+}
+
+void TooltipWindow::mouseMove (const MouseEvent&)
+{
+    startPolling();
+}
+
+void TooltipWindow::mouseExit (const MouseEvent&)
+{
+    startPolling();
 }
 
 void TooltipWindow::mouseDown (const MouseEvent&)
 {
     if (isVisible())
         dismissalMouseEventOccurred = true;
+
+    startPolling();
+}
+
+void TooltipWindow::mouseUp (const MouseEvent&)
+{
+    startPolling();
 }
 
 void TooltipWindow::mouseWheelMove (const MouseEvent&, const MouseWheelDetails&)
 {
     if (isVisible())
         dismissalMouseEventOccurred = true;
+
+    startPolling();
+}
+
+void TooltipWindow::startPolling()
+{
+    if (! isTimerRunning())
+        startTimer (123);
 }
 
 void TooltipWindow::updatePosition (const String& tip, Point<int> pos, Rectangle<int> parentArea)
@@ -104,6 +146,7 @@ void TooltipWindow::displayTip (Point<int> screenPos, const String& tip)
     jassert (tip.isNotEmpty());
 
     displayTipInternal (screenPos, tip, ShownManually::yes);
+    startPolling();
 }
 
 void TooltipWindow::displayTipInternal (Point<int> screenPos, const String& tip, ShownManually shownManually)
@@ -257,6 +300,22 @@ void TooltipWindow::timerCallback()
                 showTip();
             }
         }
+
+        // A tip on show keeps the poll, which hides or updates it when its component or text
+        // changes without the mouse moving. With none on show, nothing changes from here until
+        // the mouse does, and the mouse listener starts the poll again: either no tip is
+        // waiting, or the one waiting stays hidden until the mouse moves away from where it was
+        // last pressed.
+        const auto tipWaiting = newTip.isNotEmpty()
+                             && newTip != tipShowing
+                             && mouseSource.getLastMouseDownPosition() != lastMousePos;
+
+        if (! tipWaiting && ! isVisible())
+            stopTimer();
+    }
+    else
+    {
+        stopTimer();
     }
 }
 

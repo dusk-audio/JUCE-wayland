@@ -237,6 +237,7 @@
 
  #include "native/juce_ScopedWindowAssociation_linux.h"
  #include "native/juce_WindowUtils_linux.cpp"
+ #include "native/juce_VBlankPacer_linux.h"
 #if JUCE_WAYLAND
  #include "native/juce_Windowing_wayland.cpp"
 #endif
@@ -282,6 +283,10 @@ JUCE_BEGIN_IGNORE_WARNINGS_GCC_LIKE ("-Wzero-as-null-pointer-constant")
 
 #if JUCE_UNIT_TESTS
  #include "native/accessibility/juce_AccessibilityTextHelpers_test.cpp"
+
+ #if JUCE_LINUX || JUCE_BSD
+  #include "native/juce_VBlankPacer_linux_test.cpp"
+ #endif
 #endif
 
 //==============================================================================

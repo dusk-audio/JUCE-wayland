@@ -73,9 +73,10 @@ public:
         To change the style of tooltips, see the LookAndFeel class for its tooltip
         methods.
 
-        @param parentComponent  if set to nullptr, the TooltipWindow will appear on the desktop,
-                                otherwise the tooltip will be added to the given parent
-                                component.
+        @param parentComponent  if set to nullptr, the TooltipWindow will appear on the desktop
+                                and follow the mouse over every window, otherwise the tooltip will
+                                be added to the given parent component and follow the mouse over
+                                that component and its children.
         @param millisecondsBeforeTipAppears     the time for which the mouse has to stay still
                                                 before a tooltip will be shown
 
@@ -156,11 +157,17 @@ private:
     enum ShownManually { yes, no };
     void displayTipInternal (Point<int>, const String&, ShownManually);
 
+    Component::SafePointer<Component> mouseEventSource;
+
     void paint (Graphics&) override;
     void mouseEnter (const MouseEvent&) override;
+    void mouseMove (const MouseEvent&) override;
+    void mouseExit (const MouseEvent&) override;
     void mouseDown (const MouseEvent&) override;
+    void mouseUp (const MouseEvent&) override;
     void mouseWheelMove (const MouseEvent&, const MouseWheelDetails&) override;
     void timerCallback() override;
+    void startPolling();
     void updatePosition (const String&, Point<int>, Rectangle<int>);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TooltipWindow)

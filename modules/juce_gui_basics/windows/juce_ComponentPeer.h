@@ -525,7 +525,7 @@ public:
     };
 
     /** Adds a VBlankListener. */
-    void addVBlankListener (VBlankListener* listenerToAdd)       { vBlankListeners.add (listenerToAdd); }
+    void addVBlankListener (VBlankListener* listenerToAdd)       { vBlankListeners.add (listenerToAdd); vBlankListenerAdded(); }
 
     /** Removes a VBlankListener. */
     void removeVBlankListener (VBlankListener* listenerToRemove) { vBlankListeners.remove (listenerToRemove); }
@@ -595,6 +595,11 @@ protected:
 private:
     //==============================================================================
     virtual void appStyleChanged() {}
+
+    /** Called after a VBlankListener is added, so that a peer whose vblank source rests
+        while it is idle can start it again.
+    */
+    virtual void vBlankListenerAdded() {}
 
     /** Tells the window that text input may be required at the given position.
         This may cause things like a virtual on-screen keyboard to appear, depending
