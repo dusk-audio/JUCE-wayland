@@ -3388,15 +3388,25 @@ bool XWindowSystem::initialiseXDisplay()
                                         });
 
     // A request made outside event handling, from a timer or an async callback, sits in
-    // Xlib's buffer until something flushes it. An idle app runs no timer that would, so
-    // the message loop flushes the display each time before it sleeps.
+    // Xlib's buffer until something flushes it. An event the server sent while Xlib
+    // waited for a reply, or wrote that buffer out, is already off the socket and in
+    // Xlib's queue, where the descriptor the loop polls no longer shows it. An idle app
+    // runs no timer that would reach either, so each time before it sleeps the message
+    // loop flushes the display and hands on whatever is queued.
     LinuxEventLoopInternal::setBeforeSleepCallback ([this]
     {
-        if (display == nullptr)
-            return;
+        while (display != nullptr)
+        {
+            {
+                XWindowSystemUtilities::ScopedXLock xLock;
+                X11Symbols::getInstance()->xFlush (display);
 
-        XWindowSystemUtilities::ScopedXLock xLock;
-        X11Symbols::getInstance()->xFlush (display);
+                if (X11Symbols::getInstance()->xEventsQueued (display, QueuedAlready) == 0)
+                    return;
+            }
+
+            LinuxEventLoopInternal::invokeEventLoopCallbackForFd (X11Symbols::getInstance()->xConnectionNumber (display));
+        }
     });
 
     return true;
